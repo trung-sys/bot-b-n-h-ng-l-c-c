@@ -1,0 +1,23 @@
+from __future__ import annotations
+
+
+def test_order_service_purchase_is_atomic_and_awards_affiliate(app_container):
+    users = app_container.users_repository
+    users.ensure_user(1)
+    users.ensure_user(2)
+    users.add_balance(1, 100_000)
+    users.set_referrer_if_empty(1, 2)
+
+    app_container.affiliate_service.set_percent(2, 10)
+    category_id = app_container.catalog_service.add_category("Accounts")
+    product_id = app_container.catalog_service.add_product(category_id, "Acc VIP", 90_000, 3, "Thông tin")
+    app_container.coupon_service.save_coupon("SALE10", 0, 10, None, 0, 1)
+
+    result = app_container.order_service.purchase_product(user_id=1, product_id=product_id, coupon_code="SALE10")
+
+    assert result.order_id > 0
+    assert result.final_price == 81_000
+    assert app_container.users_repository.get_balance(1) == 19_000
+    assert app_container.users_repository.get_balance(2) == 8_100
+    assert int(app_container.catalog_repository.get_product(product_id)["stock"]) == 2
+

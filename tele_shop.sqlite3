@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+import sqlite3
+from datetime import timedelta
+
+from app.config.settings import AppSettings, DEFAULT_VIETQR_TEMPLATE
+from app.db.connection import Database
+from app.db.repositories.commerce import DepositsRepository
+from app.db.repositories.users import UsersRepository
+from app.domain.exceptions import DuplicateOperationError, ValidationError
+from app.domain.models import BankTransaction, DepositResult, PendingDepositResult
+from app.payments.vietqr import NAPID_RE, build_vietqr_image_url
+from app.utils.time import local_now, timestamp
+
+
+class DepositService:
+    def __init__(
+        self,
+        settings: AppSettings,
+        database: Database,
+        users_repository: UsersRepository,
+        deposits_repository: DepositsRepository,
+    ) -> None:
+        self.settings = settings
+        self.database = database
+        self.users_repository = users_repository
+        self.deposits_repository = deposits_repository
+
+    def create_pending_deposit(self, user_id: int, amount: int) -> PendingDepositResult:
+        if amount <= 0:
+            raise ValidationError("Số tiền không hợp lệ.")
+
+        vietqr_errors = self.settings.validate_vietqr()
+        if vietqr_errors:
+            raise ValidationError("; ".join(vietqr_errors))
+
+        add_info = f"Napid {user_id}"
+        qr_url = build_vietqr_image_url(
+            bank_id=self.settings.vietqr_bank_id,
+            account_no=self.settings.vietqr_stk,
+            template=self.settings.vietqr_template or DEFAULT_VIETQR_TEMPLATE,
+            amount=amount,
+            add_info=add_info,
+            account_name=self.settings.vietqr_ctk,
+        )
+        now = local_now()
+        expires_at = now + timedelta(minutes=self.settings.deposit_expiry_minutes)
+        pending_id = self.deposits_repository.create_pending_deposit(
+            user_id=user_id,
+            amount=amount,
+            qr_url=qr_url,
+            add_info=add_info,
+            created_at=timestamp(now),
+            expires_at=timestamp(expires_at),
+        )
+        return PendingDepositResult(
+            pending_id=pending_id,
+            user_id=user_id,
+            amount=amount,
+            qr_url=qr_url,
+            add_info=add_info,
+            expires_at=timestamp(expires_at),
+        )
+
+    def approve_pending_deposit(self, pending_id: int) -> DepositResult:
+        transaction_id = f"pending_{pending_id}"
+        with self.database.transaction(immediate=True) as connection:
+            pending = self.deposits_repository.get_pending_deposit(pending_id, con=connection)
+            if not pending:
+                raise ValidationError("❌ Yêu cầu không hợp lệ hoặc đã xử lý!")
+
+            status = str(pending["status"] or "")
+            if status in {"REJECTED", "APPROVED_MANUAL", "APPROVED_AUTO", "APPROVED_LATE"}:
+                raise DuplicateOperationError("❌ Yêu cầu không hợp lệ hoặc đã xử lý!")
+
+            existing = self.deposits_repository.get_deposit_by_transaction_id(transaction_id, con=connection)
+            if existing:
+                return DepositResult(
+                    success=True,
+                    user_id=int(existing["user_id"]),
+                    amount=int(existing["amount"]),
+                    transaction_id=transaction_id,
+                    description=str(existing["description"] or ""),
+                    status="SUCCESS",
+                    source="MANUAL_APPROVAL",
+                    deposit_id=int(existing["id"]),
+                    pending_id=pending_id,
+                    already_processed=True,
+                    message="Yêu cầu đã được duyệt trước đó.",
+                )
+
+            user_id = int(pending["user_id"])
+            amount = int(pending["amount"])
+            description = f"VietQR: {pending['add_info']}"
+
+            self.users_repository.add_balance(user_id, amount, con=connection)
+            deposit_id = self.deposits_repository.create_deposit(
+                user_id=user_id,
+                amount=amount,
+                description=description,
+                transaction_id=transaction_id,
+                status="SUCCESS",
+                source="MANUAL_APPROVAL",
+                pending_id=pending_id,
+                con=connection,
+            )
+            self.deposits_repository.update_pending_status(
+                pending_id,
+                status="APPROVED_MANUAL",
+                resolution_note="Approved manually by admin",
+                con=connection,
+            )
+
+        return DepositResult(
+            success=True,
+            user_id=user_id,
+            amount=amount,
+            transaction_id=transaction_id,
+            description=description,
+            status="SUCCESS",
+            source="MANUAL_APPROVAL",
+            deposit_id=deposit_id,
+            pending_id=pending_id,
+        )
+
+    def reject_pending_deposit(self, pending_id: int) -> DepositResult:
+        with self.database.transaction(immediate=True) as connection:
+            pending = self.deposits_repository.get_pending_deposit(pending_id, con=connection)
+            if not pending:
+                raise ValidationError("❌ Yêu cầu không hợp lệ hoặc đã xử lý!")
+
+            status = str(pending["status"] or "")
+            if status in {"REJECTED", "APPROVED_MANUAL", "APPROVED_AUTO", "APPROVED_LATE"}:
+                raise DuplicateOperationError("❌ Yêu cầu không hợp lệ hoặc đã xử lý!")
+
+            self.deposits_repository.update_pending_status(
+                pending_id,
+                status="REJECTED",
+                resolution_note="Rejected manually by admin",
+                con=connection,
+            )
+
+        return DepositResult(
+            success=True,
+            user_id=int(pending["user_id"]),
+            amount=int(pending["amount"]),
+            transaction_id=f"pending_{pending_id}",
+            description=str(pending["add_info"] or ""),
+            status="REJECTED",
+            source="MANUAL_APPROVAL",
+            pending_id=pending_id,
+        )
+
+    def cleanup_expired_pending(self) -> int:
+        return self.deposits_repository.expire_pending(timestamp(local_now()))
+
+    def credit_from_bank_transaction(self, transaction: BankTransaction) -> DepositResult:
+        tx_type = transaction.tx_type.upper().strip()
+        if tx_type != "IN" or not transaction.transaction_id or transaction.amount <= 0:
+            return DepositResult(
+                success=False,
+                user_id=0,
+                amount=max(0, transaction.amount),
+                transaction_id=transaction.transaction_id,
+                description=transaction.description,
+                status="IGNORED",
+                source="BANK_AUTO",
+                already_processed=True,
+                message="Ignored non-credit or malformed transaction.",
+            )
+
+        with self.database.transaction(immediate=True) as connection:
+            if not self.deposits_repository.insert_bank_seen_if_new(transaction.transaction_id, con=connection):
+                return DepositResult(
+                    success=False,
+                    user_id=0,
+                    amount=transaction.amount,
+                    transaction_id=transaction.transaction_id,
+                    description=transaction.description,
+                    status="IGNORED",
+                    source="BANK_AUTO",
+                    already_processed=True,
+                    message="Transaction was already processed.",
+                )
+
+            match = NAPID_RE.search(transaction.description or "")
+            if not match:
+                return DepositResult(
+                    success=False,
+                    user_id=0,
+                    amount=transaction.amount,
+                    transaction_id=transaction.transaction_id,
+                    description=transaction.description,
+                    status="IGNORED",
+                    source="BANK_AUTO",
+                    already_processed=True,
+                    message="Transaction does not contain Napid tag.",
+                )
+
+            user_id = int(match.group(1))
+            add_info = f"Napid {user_id}"
+            pending = self.deposits_repository.find_latest_pending_for_credit(
+                user_id=user_id,
+                amount=transaction.amount,
+                add_info=add_info,
+                con=connection,
+            )
+
+            if pending and str(pending["status"]) == "APPROVED_MANUAL":
+                self.deposits_repository.update_pending_status(
+                    int(pending["id"]),
+                    status="APPROVED_MANUAL",
+                    matched_transaction_id=transaction.transaction_id,
+                    resolution_note="Reconciled with bank transaction after manual approval",
+                    con=connection,
+                )
+                return DepositResult(
+                    success=True,
+                    user_id=user_id,
+                    amount=transaction.amount,
+                    transaction_id=transaction.transaction_id,
+                    description=transaction.description,
+                    status="RECONCILED",
+                    source="BANK_AUTO",
+                    pending_id=int(pending["id"]),
+                    already_processed=True,
+                    message="Matched manually approved pending deposit, skipped double credit.",
+                )
+
+            if self.deposits_repository.get_deposit_by_transaction_id(transaction.transaction_id, con=connection):
+                return DepositResult(
+                    success=False,
+                    user_id=user_id,
+                    amount=transaction.amount,
+                    transaction_id=transaction.transaction_id,
+                    description=transaction.description,
+                    status="IGNORED",
+                    source="BANK_AUTO",
+                    already_processed=True,
+                    message="Deposit row already exists for this transaction.",
+                )
+
+            self.users_repository.add_balance(user_id, transaction.amount, con=connection)
+            deposit_id = self.deposits_repository.create_deposit(
+                user_id=user_id,
+                amount=transaction.amount,
+                description=transaction.description,
+                transaction_id=transaction.transaction_id,
+                status="SUCCESS",
+                source="BANK_AUTO",
+                pending_id=int(pending["id"]) if pending else None,
+                con=connection,
+            )
+
+            pending_id: int | None = None
+            if pending:
+                pending_id = int(pending["id"])
+                resolved_status = "APPROVED_AUTO" if str(pending["status"]) == "PENDING" else "APPROVED_LATE"
+                self.deposits_repository.update_pending_status(
+                    pending_id,
+                    status=resolved_status,
+                    matched_transaction_id=transaction.transaction_id,
+                    resolution_note="Matched and credited by bank polling",
+                    con=connection,
+                )
+
+        return DepositResult(
+            success=True,
+            user_id=user_id,
+            amount=transaction.amount,
+            transaction_id=transaction.transaction_id,
+            description=transaction.description,
+            status="SUCCESS",
+            source="BANK_AUTO",
+            deposit_id=deposit_id,
+            pending_id=pending_id,
+        )
+

@@ -1,0 +1,53 @@
+from __future__ import annotations
+
+import sqlite3
+
+from app.db.repositories.base import BaseRepository
+from app.utils.time import timestamp
+
+
+class AffiliateRepository(BaseRepository):
+    def get_percent(self, user_id: int, con: sqlite3.Connection | None = None) -> int:
+        with self.connection(con, write=True) as connection:
+            row = connection.execute("SELECT percent FROM affiliate WHERE user_id=?", (user_id,)).fetchone()
+            if row:
+                return int(row["percent"] or 5)
+            connection.execute("INSERT OR IGNORE INTO affiliate(user_id, percent) VALUES(?, 5)", (user_id,))
+            return 5
+
+    def set_percent(self, user_id: int, percent: int, con: sqlite3.Connection | None = None) -> None:
+        with self.connection(con, write=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO affiliate(user_id, percent) VALUES(?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET percent=excluded.percent
+                """,
+                (user_id, percent),
+            )
+
+    def add_earning(
+        self,
+        referrer_id: int,
+        referred_user_id: int,
+        order_id: int,
+        amount: int,
+        con: sqlite3.Connection | None = None,
+    ) -> int:
+        with self.connection(con, write=True) as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO affiliate_earnings(referrer_id, referred_user_id, order_id, amount, created_at)
+                VALUES(?, ?, ?, ?, ?)
+                """,
+                (referrer_id, referred_user_id, order_id, amount, timestamp()),
+            )
+            return int(cursor.lastrowid)
+
+    def get_total_earnings(self, referrer_id: int, con: sqlite3.Connection | None = None) -> int:
+        with self.connection(con) as connection:
+            row = connection.execute(
+                "SELECT COALESCE(SUM(amount), 0) AS total FROM affiliate_earnings WHERE referrer_id=?",
+                (referrer_id,),
+            ).fetchone()
+            return int(row["total"] or 0) if row else 0
+

@@ -1,0 +1,16 @@
+from __future__ import annotations
+
+
+COLOR_PALETTE = {
+    "bg_main": "#0b1017",
+    "card_bg": "#161d27",
+    "card_alt": "#1f2835",
+    "primary": "#37b7ff",
+    "accent": "#ff7a1f",
+    "success": "#28c76f",
+    "danger": "#ff4d4f",
+    "text_primary": "#f5f7fa",
+    "text_secondary": "#98a6b5",
+    "border": "#2d3748",
+}
+

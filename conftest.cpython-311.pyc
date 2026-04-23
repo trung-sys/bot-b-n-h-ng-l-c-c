@@ -1,0 +1,23 @@
+from __future__ import annotations
+
+
+def test_affiliate_service_awards_balance_and_summary(app_container):
+    users = app_container.users_repository
+    users.ensure_user(100)
+    users.ensure_user(200)
+
+    app_container.affiliate_service.set_percent(200, 12)
+    earned = app_container.affiliate_service.award_commission(
+        referrer_id=200,
+        referred_user_id=100,
+        order_id=1,
+        final_price=100_000,
+    )
+
+    assert earned == 12_000
+    assert users.get_balance(200) == 12_000
+
+    summary = app_container.affiliate_service.get_summary(200, "TestBot")
+    assert summary.total_earnings == 12_000
+    assert summary.referral_link.endswith("start=ref_200")
+

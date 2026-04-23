@@ -1,0 +1,30 @@
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.config.loader import load_settings
+from app.runtime import ApplicationRuntime
+
+
+def main() -> None:
+    settings = load_settings()
+    runtime = ApplicationRuntime(settings)
+    runtime.start_bot()
+    runtime.start_bank_poller()
+    print("Bot + bank poller started. Press Ctrl+C to stop.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        runtime.stop_all()
+        print("Stopped.")
+
+
+if __name__ == "__main__":
+    main()

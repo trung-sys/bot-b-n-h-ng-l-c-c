@@ -1,0 +1,29 @@
+from __future__ import annotations
+
+import sqlite3
+from contextlib import contextmanager
+from typing import Iterator
+
+from app.db.connection import Database
+
+
+class BaseRepository:
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    @contextmanager
+    def connection(self, existing: sqlite3.Connection | None = None, write: bool = False) -> Iterator[sqlite3.Connection]:
+        owns_connection = existing is None
+        connection = existing or self.database.connect()
+        try:
+            yield connection
+            if owns_connection and write:
+                connection.commit()
+        except Exception:
+            if owns_connection and write:
+                connection.rollback()
+            raise
+        finally:
+            if owns_connection:
+                connection.close()
+

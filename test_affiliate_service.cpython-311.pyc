@@ -1,0 +1,27 @@
+from __future__ import annotations
+
+from app.domain.models import BankTransaction
+
+
+def test_deposit_service_reconciles_manual_approval_without_double_credit(app_container):
+    users = app_container.users_repository
+    users.ensure_user(1)
+
+    pending = app_container.deposit_service.create_pending_deposit(user_id=1, amount=50_000)
+    manual = app_container.deposit_service.approve_pending_deposit(pending.pending_id)
+    assert manual.success is True
+    assert users.get_balance(1) == 50_000
+
+    auto = app_container.deposit_service.credit_from_bank_transaction(
+        BankTransaction(
+            transaction_id="tx-001",
+            amount=50_000,
+            description="Napid 1",
+            tx_type="IN",
+            raw_payload={},
+        )
+    )
+
+    assert auto.already_processed is True
+    assert users.get_balance(1) == 50_000
+

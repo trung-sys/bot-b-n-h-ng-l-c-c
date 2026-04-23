@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+
+def user_main_keyboard(is_admin: bool, show_support: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🎁 Chuyên mục", callback_data="u:cats")],
+        [
+            InlineKeyboardButton("💳 Nạp tiền", callback_data="u:deposit"),
+            InlineKeyboardButton("📊 Lịch sử mua", callback_data="u:history"),
+        ],
+        [InlineKeyboardButton("💎 Tiếp thị liên kết", callback_data="u:aff")],
+    ]
+    if show_support:
+        rows.append([InlineKeyboardButton("🆘 Hỗ trợ", callback_data="u:support")])
+    if is_admin:
+        rows.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="a:panel")])
+    return InlineKeyboardMarkup(rows)
+
+
+def admin_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("✨ Thêm chuyên mục", callback_data="a:addcat"),
+            InlineKeyboardButton("🎨 Sửa chuyên mục", callback_data="a:editcat"),
+        ],
+        [InlineKeyboardButton("❌ Xóa chuyên mục", callback_data="a:delcat")],
+        [
+            InlineKeyboardButton("✨ Thêm sản phẩm", callback_data="a:addprod"),
+            InlineKeyboardButton("🎨 Sửa sản phẩm", callback_data="a:editprod"),
+        ],
+        [InlineKeyboardButton("❌ Xóa sản phẩm", callback_data="a:delprod")],
+        [
+            InlineKeyboardButton("👑 Coupon: Thêm/Update", callback_data="a:addcoupon"),
+            InlineKeyboardButton("🚫 Coupon: Tắt", callback_data="a:delcoupon"),
+        ],
+        [InlineKeyboardButton("💸 % Hoa hồng", callback_data="a:setcomm")],
+        [InlineKeyboardButton("📣 Broadcast", callback_data="a:broadcast")],
+        [InlineKeyboardButton("⬅️ Quay lại", callback_data="u:home")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def categories_keyboard(categories) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"🎁 {item['name']}", callback_data=f"u:cat:{item['id']}")] for item in categories]
+    rows.append([InlineKeyboardButton("⬅️ Quay lại", callback_data="u:home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def products_keyboard(products) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(
+                f"🛒 {item['name']} — {int(item['price']):,}đ (Kho: {int(item['stock'])})",
+                callback_data=f"u:prod:{item['id']}",
+            )
+        ]
+        for item in products
+    ]
+    rows.append([InlineKeyboardButton("⬅️ Quay lại", callback_data="u:cats")])
+    return InlineKeyboardMarkup(rows)
+
+
+def product_detail_keyboard(product_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Mua ngay", callback_data=f"u:buy:{product_id}")],
+            [InlineKeyboardButton("⬅️ Quay lại", callback_data="u:cats")],
+        ]
+    )
+
+
+def coupon_choice_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Có", callback_data="u:coupon_yes"),
+                InlineKeyboardButton("❌ Không", callback_data="u:coupon_no"),
+            ],
+            [InlineKeyboardButton("⬅️ Huỷ", callback_data="u:home")],
+        ]
+    )
+
+
+def deposit_approval_keyboard(pending_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Duyệt", callback_data=f"admin:approve_dep:{pending_id}"),
+                InlineKeyboardButton("❌ Từ chối", callback_data=f"admin:reject_dep:{pending_id}"),
+            ]
+        ]
+    )
+

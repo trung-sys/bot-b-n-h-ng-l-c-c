@@ -1,0 +1,67 @@
+from __future__ import annotations
+
+import sqlite3
+
+from app.db.repositories.base import BaseRepository
+from app.domain.models import DashboardSummary
+
+
+class StatsRepository(BaseRepository):
+    def get_dashboard_summary(self, con: sqlite3.Connection | None = None) -> DashboardSummary:
+        with self.connection(con) as connection:
+            user_count = int(connection.execute("SELECT COUNT(*) FROM users").fetchone()[0])
+            order_row = connection.execute(
+                "SELECT COUNT(*) AS c, COALESCE(SUM(final_price), 0) AS revenue FROM orders WHERE status='PAID'"
+            ).fetchone()
+            deposit_row = connection.execute(
+                "SELECT COUNT(*) AS c, COALESCE(SUM(amount), 0) AS total FROM deposits WHERE status='SUCCESS'"
+            ).fetchone()
+            commission_row = connection.execute(
+                "SELECT COALESCE(SUM(amount), 0) AS total FROM affiliate_earnings"
+            ).fetchone()
+            category_count = int(connection.execute("SELECT COUNT(*) FROM categories WHERE is_active=1").fetchone()[0])
+            product_count = int(connection.execute("SELECT COUNT(*) FROM products WHERE is_active=1").fetchone()[0])
+            pending_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM pending_deposits WHERE status IN ('PENDING', 'EXPIRED')"
+                ).fetchone()[0]
+            )
+            approved_deposit_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM pending_deposits WHERE status IN ('APPROVED_MANUAL', 'APPROVED_AUTO', 'APPROVED_LATE')"
+                ).fetchone()[0]
+            )
+
+        return DashboardSummary(
+            total_users=user_count,
+            total_orders=int(order_row["c"] or 0),
+            total_revenue=int(order_row["revenue"] or 0),
+            total_deposits=int(deposit_row["total"] or 0),
+            total_commission=int(commission_row["total"] or 0),
+            active_categories=category_count,
+            active_products=product_count,
+            pending_deposits=pending_count,
+            approved_deposits=approved_deposit_count,
+        )
+
+    def get_order_export_rows(self, con: sqlite3.Connection | None = None) -> list[sqlite3.Row]:
+        with self.connection(con) as connection:
+            return connection.execute(
+                """
+                SELECT o.id, o.user_id, o.product_id, p.name AS product_name, o.price, o.discount,
+                       o.final_price, o.coupon_code, o.status, o.created_at
+                FROM orders o
+                LEFT JOIN products p ON p.id=o.product_id
+                ORDER BY o.id DESC
+                """
+            ).fetchall()
+
+    def get_deposit_export_rows(self, con: sqlite3.Connection | None = None) -> list[sqlite3.Row]:
+        with self.connection(con) as connection:
+            return connection.execute(
+                """
+                SELECT id, user_id, amount, description, trans_id, status, source, pending_id, created_at
+                FROM deposits
+                ORDER BY id DESC
+                """
+            ).fetchall()

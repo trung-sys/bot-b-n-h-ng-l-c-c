@@ -1,0 +1,173 @@
+from __future__ import annotations
+
+from html import escape
+
+from app.config.settings import AppSettings
+from app.domain.models import PendingDepositResult, PurchaseResult, ReferralSummary
+from app.utils.time import timestamp
+
+
+def _user_line(user_row, user_id: int) -> str:
+    username = escape(str(user_row["username"])) if user_row and user_row["username"] else ""
+    first_name = escape(str(user_row["first_name"])) if user_row and user_row["first_name"] else ""
+    parts = [f"<code>{user_id}</code>"]
+    if username:
+        parts.append(f"@{username}")
+    elif first_name:
+        parts.append(first_name)
+    return " • ".join(parts)
+
+
+def home_text(first_name: str, balance: int, maintenance_mode: bool = False) -> str:
+    notice = "\n⚠️ Hệ thống đang ở chế độ bảo trì.\n" if maintenance_mode else "\n"
+    return (
+        f"👋 Xin chào <b>{escape(first_name)}</b>\n"
+        f"💰 Số dư: <b>{balance:,}đ</b>{notice}\n"
+        "Chọn chức năng bên dưới:"
+    )
+
+
+def product_detail_text(product) -> str:
+    return (
+        f"🛒 <b>{escape(str(product['name']))}</b>\n"
+        f"💵 Giá: <b>{int(product['price']):,}đ</b>\n"
+        f"📦 Kho: <b>{int(product['stock']):,}</b>\n\n"
+        "Bạn muốn mua?"
+    )
+
+
+def order_history_text(orders: list, limit: int) -> str:
+    if not orders:
+        return "🧾 Chưa có đơn hàng."
+    lines = [f"📊 <b>Lịch sử mua</b> ({limit} đơn gần nhất):\n"]
+    for order in orders:
+        lines.append(
+            f"#{order['id']} • {escape(str(order['product_name'] or 'SP'))} • "
+            f"{int(order['final_price']):,}đ • {escape(str(order['status']))} • {escape(str(order['created_at']))}"
+        )
+    return "\n".join(lines)
+
+
+def affiliate_text(summary: ReferralSummary) -> str:
+    return (
+        "🤝 <b>Tiếp thị liên kết</b>\n"
+        f"🔗 Link ref: <code>{escape(summary.referral_link)}</code>\n"
+        f"💸 % hoa hồng hiện tại: <b>{summary.percent}%</b>\n"
+        f"🏦 Tổng hoa hồng đã nhận: <b>{summary.total_earnings:,}đ</b>\n\n"
+        "Gửi link cho người khác, họ /start bằng link đó, khi họ mua bạn sẽ nhận hoa hồng."
+    )
+
+
+def purchase_success_text(result: PurchaseResult) -> str:
+    return (
+        "✅ <b>Mua thành công</b>\n"
+        f"🧾 Đơn: <b>#{result.order_id}</b>\n"
+        f"🛒 Sản phẩm: <b>{escape(result.product_name)}</b>\n"
+        f"💵 Giá: <b>{result.price:,}đ</b>\n"
+        f"🏷 Giảm: <b>{result.discount:,}đ</b>\n"
+        f"✅ Thanh toán: <b>{result.final_price:,}đ</b>\n\n"
+        f"📦 <b>Nội dung giao:</b>\n{escape(result.deliver_text)}"
+    )
+
+
+def purchase_log_text(user_row, result: PurchaseResult) -> str:
+    return (
+        "🛍️ <b>ĐƠN HÀNG MỚI</b>\n"
+        f"📝 Mã đơn: <b>#{result.order_id}</b>\n"
+        f"👤 User: {_user_line(user_row, result.user_id)}\n"
+        f"🎁 Sản phẩm: <b>{escape(result.product_name)}</b>\n"
+        f"💵 Giá gốc: <b>{result.price:,}đ</b>\n"
+        f"🏷 Giảm giá: <b>{result.discount:,}đ</b>\n"
+        f"✅ Thanh toán: <b>{result.final_price:,}đ</b>\n"
+        f"🎫 Coupon: <code>{escape(result.applied_coupon or 'none')}</code>\n"
+        f"⏰ Thời gian: <code>{timestamp()}</code>"
+    )
+
+
+def pending_deposit_caption(settings: AppSettings, pending: PendingDepositResult) -> str:
+    return (
+        "💳 <b>Nạp tiền</b>\n\n"
+        f"💰 <b>Số tiền:</b> {pending.amount:,}đ\n"
+        f"✅ <b>Nội dung:</b> <code>{escape(pending.add_info)}</code>\n"
+        f"💳 <b>STK:</b> <code>{escape(settings.vietqr_stk)}</code>\n"
+        f"👤 <b>Chủ tài khoản:</b> <code>{escape(settings.vietqr_ctk)}</code>\n"
+        f"🏦 <b>Ngân hàng:</b> {escape(settings.vietqr_bank_name)}\n\n"
+        f"⏰ <i>QR sẽ hết hạn lúc {escape(pending.expires_at)}</i>"
+    )
+
+
+def pending_deposit_fallback_text(settings: AppSettings, pending: PendingDepositResult) -> str:
+    return (
+        "💳 <b>Nạp tiền</b>\n"
+        f"✅ Nội dung chuyển khoản: <code>{escape(pending.add_info)}</code>\n"
+        f"💰 Số tiền: <b>{pending.amount:,}đ</b>\n"
+        f"💳 STK: <code>{escape(settings.vietqr_stk)}</code>\n"
+        f"👤 Chủ tài khoản: <code>{escape(settings.vietqr_ctk)}</code>\n\n"
+        "📌 Quét QR hoặc mở link bên dưới để chuyển khoản đúng nội dung.\n"
+        f"🔗 QR: {escape(pending.qr_url)}\n\n"
+        f"⏰ <i>QR sẽ hết hạn lúc {escape(pending.expires_at)}</i>"
+    )
+
+
+def manual_deposit_admin_text(
+    user_id: int,
+    username: str | None,
+    amount: int,
+    add_info: str,
+    pending_id: int | None,
+    source_label: str,
+    qr_url: str | None = None,
+) -> str:
+    username_line = f"@{escape(username)}" if username else "N/A"
+    pending_line = f"🆔 Mã pending: #{pending_id}\n" if pending_id else ""
+    qr_line = f"\n🔗 QR: {escape(qr_url)}" if qr_url else ""
+    return (
+        f"🔔 <b>{escape(source_label)}</b>\n"
+        f"👤 User: <code>{user_id}</code>\n"
+        f"📝 Username: {username_line}\n"
+        f"💰 Số tiền: <b>{amount:,}đ</b>\n"
+        f"✅ Nội dung: <code>{escape(add_info)}</code>\n"
+        f"⏰ Thời gian: <code>{timestamp()}</code>\n"
+        f"{pending_line}"
+        f"{qr_line}"
+    )
+
+
+def manual_deposit_approved_text(amount: int) -> str:
+    return (
+        "✅ <b>Nạp tiền được duyệt</b>\n"
+        f"💰 Số tiền: <b>{amount:,}đ</b>\n"
+        f"⏰ Thời gian: <code>{timestamp()}</code>"
+    )
+
+
+def manual_deposit_rejected_text(amount: int) -> str:
+    return (
+        "❌ <b>Yêu cầu nạp tiền bị từ chối</b>\n"
+        f"💰 Số tiền: <b>{amount:,}đ</b>\n"
+        "📝 Hãy liên hệ admin nếu có thắc mắc."
+    )
+
+
+def deposit_success_text(amount: int, transaction_id: str) -> str:
+    return f"✅ Nạp thành công {amount:,}đ\n🧾 Mã GD: {escape(transaction_id)}"
+
+
+def deposit_log_text(user_row, user_id: int, amount: int, transaction_id: str, description: str) -> str:
+    return (
+        "💳 <b>NẠP TIỀN THÀNH CÔNG</b>\n"
+        f"👤 User: {_user_line(user_row, user_id)}\n"
+        f"💰 Số tiền: <b>{amount:,}đ</b>\n"
+        f"🧾 Mã GD: <code>{escape(transaction_id)}</code>\n"
+        f"📝 Nội dung: <code>{escape(description[:300])}</code>\n"
+        f"⏰ Thời gian: <code>{timestamp()}</code>"
+    )
+
+
+def support_text(contact: str) -> str:
+    return (
+        "🆘 <b>Hỗ trợ</b>\n"
+        f"Liên hệ: <code>{escape(contact)}</code>\n"
+        "Khi cần hỗ trợ nạp tiền hoặc đơn hàng, hãy gửi kèm mã đơn / mã giao dịch."
+    )
+

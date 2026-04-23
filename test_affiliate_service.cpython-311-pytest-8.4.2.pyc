@@ -1,0 +1,15 @@
+from __future__ import annotations
+
+
+def test_coupon_service_applies_percent_and_validates_scope(app_container):
+    service = app_container.coupon_service
+    service.save_coupon("sale10", 0, 10, None, 10_000, 2)
+    decision = service.evaluate_coupon(product_id=1, price=50_000, coupon_code="sale10")
+    assert decision.applied_code == "SALE10"
+    assert decision.discount == 5_000
+
+    service.save_coupon("onlyprod", 20_000, 0, 5, 0, 0)
+    mismatch = service.evaluate_coupon(product_id=1, price=50_000, coupon_code="onlyprod")
+    assert mismatch.applied_code is None
+    assert mismatch.warnings
+

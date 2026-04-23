@@ -1,0 +1,75 @@
+from __future__ import annotations
+
+import sqlite3
+
+from app.db.repositories.base import BaseRepository
+from app.utils.time import timestamp
+
+
+class UsersRepository(BaseRepository):
+    def upsert_user(self, user_id: int, username: str = "", first_name: str = "", con: sqlite3.Connection | None = None) -> None:
+        with self.connection(con, write=True) as connection:
+            connection.execute(
+                """
+                INSERT INTO users(user_id, username, first_name, balance, ref_by, created_at)
+                VALUES(?, ?, ?, 0, NULL, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username=excluded.username,
+                    first_name=excluded.first_name
+                """,
+                (user_id, username or "", first_name or "", timestamp()),
+            )
+
+    def ensure_user(self, user_id: int, con: sqlite3.Connection | None = None) -> None:
+        with self.connection(con, write=True) as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO users(user_id, username, first_name, balance, ref_by, created_at)
+                VALUES(?, '', '', 0, NULL, ?)
+                """,
+                (user_id, timestamp()),
+            )
+
+    def set_referrer_if_empty(self, user_id: int, ref_by: int, con: sqlite3.Connection | None = None) -> bool:
+        if user_id == ref_by:
+            return False
+        with self.connection(con, write=True) as connection:
+            cursor = connection.execute(
+                "UPDATE users SET ref_by=? WHERE user_id=? AND (ref_by IS NULL OR ref_by=0)",
+                (ref_by, user_id),
+            )
+            return cursor.rowcount > 0
+
+    def get_user(self, user_id: int, con: sqlite3.Connection | None = None) -> sqlite3.Row | None:
+        with self.connection(con) as connection:
+            return connection.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+
+    def get_balance(self, user_id: int, con: sqlite3.Connection | None = None) -> int:
+        row = self.get_user(user_id, con)
+        return int(row["balance"] or 0) if row else 0
+
+    def add_balance(self, user_id: int, amount: int, con: sqlite3.Connection | None = None) -> None:
+        with self.connection(con, write=True) as connection:
+            self.ensure_user(user_id, connection)
+            connection.execute(
+                "UPDATE users SET balance = COALESCE(balance, 0) + ? WHERE user_id=?",
+                (amount, user_id),
+            )
+
+    def subtract_balance_if_enough(self, user_id: int, amount: int, con: sqlite3.Connection | None = None) -> bool:
+        with self.connection(con, write=True) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE users
+                SET balance = balance - ?
+                WHERE user_id=? AND COALESCE(balance, 0) >= ?
+                """,
+                (amount, user_id, amount),
+            )
+            return cursor.rowcount > 0
+
+    def list_user_ids(self, con: sqlite3.Connection | None = None) -> list[int]:
+        with self.connection(con) as connection:
+            rows = connection.execute("SELECT user_id FROM users ORDER BY user_id").fetchall()
+            return [int(row["user_id"]) for row in rows]
+

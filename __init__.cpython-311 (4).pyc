@@ -1,0 +1,722 @@
+from __future__ import annotations
+
+import logging
+import os
+import time
+from html import escape
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+from app.bot.keyboards import (
+    admin_keyboard,
+    categories_keyboard,
+    coupon_choice_keyboard,
+    deposit_approval_keyboard,
+    product_detail_keyboard,
+    products_keyboard,
+    user_main_keyboard,
+)
+from app.bot.text import (
+    affiliate_text,
+    deposit_log_text,
+    home_text,
+    manual_deposit_admin_text,
+    manual_deposit_approved_text,
+    manual_deposit_rejected_text,
+    order_history_text,
+    pending_deposit_caption,
+    pending_deposit_fallback_text,
+    product_detail_text,
+    purchase_log_text,
+    purchase_success_text,
+    support_text,
+)
+from app.domain.exceptions import AppError, BusinessRuleError, DuplicateOperationError, ValidationError
+from app.services.affiliate_service import AffiliateService
+from app.services.catalog_service import CatalogService
+from app.services.coupon_service import CouponService
+from app.services.deposit_service import DepositService
+from app.services.order_service import OrderService
+from app.services.stats_service import StatsService
+from app.services.user_service import UserService
+from app.utils.validation import normalize_code, parse_int
+
+
+class TelegramShopBot:
+    def __init__(
+        self,
+        settings,
+        user_service: UserService,
+        catalog_service: CatalogService,
+        coupon_service: CouponService,
+        affiliate_service: AffiliateService,
+        order_service: OrderService,
+        deposit_service: DepositService,
+        stats_service: StatsService,
+        logger: logging.Logger,
+    ) -> None:
+        self.settings = settings
+        self.user_service = user_service
+        self.catalog_service = catalog_service
+        self.coupon_service = coupon_service
+        self.affiliate_service = affiliate_service
+        self.order_service = order_service
+        self.deposit_service = deposit_service
+        self.stats_service = stats_service
+        self.logger = logger
+        self.admin_sessions: set[int] = set()
+        self._cooldowns: dict[tuple[int, str], float] = {}
+        self._bot_username: str = ""
+
+    def set_bot_username(self, username: str) -> None:
+        self._bot_username = username or ""
+
+    def register(self, application: Application) -> None:
+        application.add_handler(CommandHandler("start", self.cmd_start))
+        application.add_handler(CommandHandler("help", self.cmd_help))
+        application.add_handler(CommandHandler("checkadmin", self.cmd_checkadmin))
+        application.add_handler(CommandHandler("getchatid", self.cmd_getchatid))
+        application.add_handler(CommandHandler("adminstats", self.cmd_adminstats))
+        application.add_handler(CommandHandler("addcat", self.cmd_addcat))
+        application.add_handler(CommandHandler("editcat", self.cmd_editcat))
+        application.add_handler(CommandHandler("delcat", self.cmd_delcat))
+        application.add_handler(CommandHandler("addprod", self.cmd_addprod))
+        application.add_handler(CommandHandler("editprod", self.cmd_editprod))
+        application.add_handler(CommandHandler("delprod", self.cmd_delprod))
+        application.add_handler(CommandHandler("coupon", self.cmd_coupon))
+        application.add_handler(CommandHandler("couponoff", self.cmd_couponoff))
+        application.add_handler(CommandHandler("setcomm", self.cmd_setcomm))
+        application.add_handler(CommandHandler("broadcast", self.cmd_broadcast))
+        application.add_handler(CallbackQueryHandler(self.on_callback))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_message))
+
+    def _is_admin_identity(self, user_id: int) -> bool:
+        return user_id == int(self.settings.admin_id or 0)
+
+    def _has_admin_session(self, user_id: int) -> bool:
+        return self._is_admin_identity(user_id) and user_id in self.admin_sessions
+
+    def _main_keyboard(self, user_id: int) -> InlineKeyboardMarkup:
+        return user_main_keyboard(
+            is_admin=self._has_admin_session(user_id),
+            show_support=bool(self.settings.support_contact),
+        )
+
+    def _touch_user(self, telegram_user) -> None:
+        self.user_service.touch_user(
+            user_id=telegram_user.id,
+            username=telegram_user.username or "",
+            first_name=telegram_user.first_name or "",
+        )
+
+    def _cooldown_hit(self, user_id: int, key: str) -> bool:
+        cooldown = max(0, int(self.settings.command_cooldown_seconds))
+        if cooldown == 0:
+            return False
+        now = time.monotonic()
+        slot = (user_id, key)
+        last = self._cooldowns.get(slot, 0.0)
+        if now - last < cooldown:
+            return True
+        self._cooldowns[slot] = now
+        return False
+
+    async def _ensure_bot_username(self, context: ContextTypes.DEFAULT_TYPE) -> str:
+        if self._bot_username:
+            return self._bot_username
+        me = await context.bot.get_me()
+        self._bot_username = me.username or "YourBot"
+        return self._bot_username
+
+    async def _send_log_group(self, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+        if int(self.settings.log_group_id or 0) <= 0:
+            return
+        try:
+            await context.bot.send_message(
+                chat_id=int(self.settings.log_group_id),
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            self.logger.exception("Failed to send log group message.")
+
+    def _maintenance_blocked(self, user_id: int) -> bool:
+        return bool(self.settings.maintenance_mode and not self._is_admin_identity(user_id))
+
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user or not update.message:
+            return
+        self._touch_user(user)
+
+        if context.args:
+            arg = context.args[0].strip()
+            if arg.lower().startswith("ref_"):
+                referrer_id = parse_int(arg.split("_", 1)[1], 0)
+                if referrer_id > 0:
+                    self.user_service.bind_referral(user.id, referrer_id)
+
+        if self.settings.start_video_path and os.path.exists(self.settings.start_video_path):
+            try:
+                with open(self.settings.start_video_path, "rb") as video_file:
+                    await update.message.reply_video(video=video_file, caption="🎉 Chào mừng bạn!")
+            except Exception:
+                self.logger.exception("Failed to send /start video.")
+
+        await update.message.reply_text(
+            home_text(user.first_name or "bạn", self.user_service.get_balance(user.id), self.settings.maintenance_mode),
+            reply_markup=self._main_keyboard(user.id),
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def cmd_checkadmin(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user or not update.message:
+            return
+        self._touch_user(user)
+        if self._is_admin_identity(user.id):
+            self.admin_sessions.add(user.id)
+            await update.message.reply_text("✅ Đã bật chế độ Admin ẩn.", reply_markup=self._main_keyboard(user.id))
+        else:
+            await update.message.reply_text("❌ Bạn không phải admin.")
+
+    async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.message:
+            return
+        await update.message.reply_text(
+            "📌 Lệnh:\n"
+            "/start\n"
+            "/checkadmin (admin ẩn)\n"
+            "/help\n"
+            "/getchatid\n"
+            "/adminstats\n\n"
+            "Admin sau /checkadmin dùng Admin Panel hoặc các lệnh quản trị."
+        )
+
+    async def cmd_getchatid(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.message or not update.effective_chat:
+            return
+        await update.message.reply_text(
+            f"🆔 Chat ID: <code>{update.effective_chat.id}</code>\n📝 Type: <b>{escape(update.effective_chat.type)}</b>",
+            parse_mode=ParseMode.HTML,
+        )
+
+    async def cmd_adminstats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.admin_guard(update):
+            return
+        assert update.message is not None
+        await update.message.reply_text(self.stats_service.build_admin_summary_text())
+
+    async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if not query:
+            return
+        await query.answer()
+        user = query.from_user
+        self._touch_user(user)
+        data = query.data or ""
+
+        if data == "u:home":
+            await query.edit_message_text(
+                f"🏠 Menu chính\n💰 Số dư: <b>{self.user_service.get_balance(user.id):,}đ</b>",
+                reply_markup=self._main_keyboard(user.id),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if data == "u:support":
+            await query.edit_message_text(
+                support_text(self.settings.support_contact),
+                parse_mode=ParseMode.HTML,
+                reply_markup=self._main_keyboard(user.id),
+            )
+            return
+
+        if self._maintenance_blocked(user.id) and data in {"u:cats", "u:deposit"}:
+            await query.edit_message_text(
+                "⚠️ Hệ thống đang bảo trì. Vui lòng quay lại sau.",
+                reply_markup=self._main_keyboard(user.id),
+            )
+            return
+
+        if data == "u:cats":
+            categories = self.catalog_service.list_categories()
+            if not categories:
+                await query.edit_message_text(
+                    "❌ Chưa có chuyên mục. Admin thêm chuyên mục trước.",
+                    reply_markup=self._main_keyboard(user.id),
+                )
+                return
+            await query.edit_message_text("🎪 Chọn chuyên mục:", reply_markup=categories_keyboard(categories))
+            return
+
+        if data.startswith("u:cat:"):
+            category_id = parse_int(data.split(":")[2], 0)
+            products = self.catalog_service.list_products_by_category(category_id)
+            if not products:
+                await query.edit_message_text(
+                    "❌ Chưa có sản phẩm trong chuyên mục này.",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("⬅️ Quay lại", callback_data="u:cats")]]
+                    ),
+                )
+                return
+            await query.edit_message_text("🛍 Chọn sản phẩm:", reply_markup=products_keyboard(products))
+            return
+
+        if data.startswith("u:prod:"):
+            product_id = parse_int(data.split(":")[2], 0)
+            product = self.catalog_service.get_product(product_id)
+            if not product:
+                await query.edit_message_text("❌ Sản phẩm không tồn tại.", reply_markup=self._main_keyboard(user.id))
+                return
+            await query.edit_message_text(
+                product_detail_text(product),
+                reply_markup=product_detail_keyboard(product_id),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if data.startswith("u:buy:"):
+            if self._maintenance_blocked(user.id):
+                await query.edit_message_text("⚠️ Hệ thống đang bảo trì. Vui lòng quay lại sau.", reply_markup=self._main_keyboard(user.id))
+                return
+            if self._cooldown_hit(user.id, "buy"):
+                await query.answer("Thao tác quá nhanh, thử lại sau 1 chút.", show_alert=True)
+                return
+            product_id = parse_int(data.split(":")[2], 0)
+            product = self.catalog_service.get_product(product_id)
+            if not product:
+                await query.edit_message_text("❌ Sản phẩm không tồn tại.", reply_markup=self._main_keyboard(user.id))
+                return
+            if int(product["stock"] or 0) <= 0:
+                await query.edit_message_text("❌ Hết hàng.", reply_markup=self._main_keyboard(user.id))
+                return
+            context.user_data["purchase_product_id"] = product_id
+            await query.edit_message_text("🏷 Bạn có muốn nhập mã giảm giá không?", reply_markup=coupon_choice_keyboard())
+            return
+
+        if data == "u:coupon_no":
+            await self._finalize_purchase(user.id, None, query.message, context)
+            return
+
+        if data == "u:coupon_yes":
+            context.user_data["waiting_coupon"] = True
+            await query.edit_message_text("📩 Hãy gửi <b>mã giảm giá</b> (ví dụ: SALE10):", parse_mode=ParseMode.HTML)
+            return
+
+        if data == "u:deposit":
+            if self._cooldown_hit(user.id, "deposit"):
+                await query.answer("Thao tác quá nhanh, thử lại sau 1 chút.", show_alert=True)
+                return
+            context.user_data["waiting_deposit_amount"] = True
+            await query.edit_message_text("💳 Nhập số tiền bạn muốn nạp (VD: 50000):")
+            return
+
+        if data == "u:history":
+            text = order_history_text(
+                self.user_service.get_order_history(user.id, self.settings.history_limit),
+                self.settings.history_limit,
+            )
+            await query.edit_message_text(text, reply_markup=self._main_keyboard(user.id), parse_mode=ParseMode.HTML)
+            return
+
+        if data == "u:aff":
+            summary = self.affiliate_service.get_summary(user.id, await self._ensure_bot_username(context))
+            await query.edit_message_text(
+                affiliate_text(summary),
+                reply_markup=self._main_keyboard(user.id),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if data == "a:panel":
+            if not self._has_admin_session(user.id):
+                await query.edit_message_text("❌ Chưa bật admin. Dùng /checkadmin", reply_markup=self._main_keyboard(user.id))
+                return
+            await query.edit_message_text("🛠 <b>Admin Panel</b>", reply_markup=admin_keyboard(), parse_mode=ParseMode.HTML)
+            return
+
+        if data.startswith("admin:approve_dep:"):
+            if not self._is_admin_identity(user.id):
+                await query.answer("❌ Không có quyền!", show_alert=True)
+                return
+            pending_id = parse_int(data.split(":")[-1], 0)
+            try:
+                result = self.deposit_service.approve_pending_deposit(pending_id)
+            except AppError as exc:
+                await query.answer(str(exc), show_alert=True)
+                return
+
+            try:
+                await context.bot.send_message(
+                    chat_id=result.user_id,
+                    text=manual_deposit_approved_text(result.amount),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                self.logger.exception("Failed to notify user about manual deposit approval.")
+
+            user_row = self.user_service.get_user(result.user_id)
+            await self._send_log_group(
+                context,
+                deposit_log_text(user_row, result.user_id, result.amount, result.transaction_id, result.description),
+            )
+            await query.edit_message_text("✅ <b>Đã duyệt nạp tiền</b>\n💰 Đã cộng vào tài khoản user", parse_mode=ParseMode.HTML)
+            return
+
+        if data.startswith("admin:reject_dep:"):
+            if not self._is_admin_identity(user.id):
+                await query.answer("❌ Không có quyền!", show_alert=True)
+                return
+            pending_id = parse_int(data.split(":")[-1], 0)
+            try:
+                result = self.deposit_service.reject_pending_deposit(pending_id)
+            except AppError as exc:
+                await query.answer(str(exc), show_alert=True)
+                return
+
+            try:
+                await context.bot.send_message(
+                    chat_id=result.user_id,
+                    text=manual_deposit_rejected_text(result.amount),
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                self.logger.exception("Failed to notify user about manual deposit rejection.")
+            await query.edit_message_text("❌ <b>Đã từ chối yêu cầu nạp tiền</b>", parse_mode=ParseMode.HTML)
+            return
+
+        if data.startswith("a:"):
+            if not self._has_admin_session(user.id):
+                await query.edit_message_text("❌ Bạn không có quyền.", reply_markup=self._main_keyboard(user.id))
+                return
+            action = data.split(":")[1]
+            mapping = {
+                "addcat": "✨ Gửi: <code>/addcat Tên chuyên mục</code>",
+                "editcat": "🎨 Gửi: <code>/editcat ID Tên mới</code>",
+                "delcat": "❌ Gửi: <code>/delcat ID</code>",
+                "addprod": "✨ Gửi:\n<code>/addprod CAT_ID | Tên SP | Giá | Kho | Nội dung giao</code>",
+                "editprod": "🎨 Gửi:\n<code>/editprod PROD_ID | Tên SP | Giá | Kho | Nội dung giao</code>",
+                "delprod": "❌ Gửi: <code>/delprod PROD_ID</code>",
+                "addcoupon": (
+                    "👑 Gửi:\n<code>/coupon CODE | giam_tien | giam_% | apply_prod_id_or_all | min_order | max_uses</code>\n"
+                    "Ví dụ: <code>/coupon SALE10 | 0 | 10 | all | 0 | 0</code>"
+                ),
+                "delcoupon": "🚫 Gửi: <code>/couponoff CODE</code>",
+                "setcomm": "💸 Gửi: <code>/setcomm USER_ID PERCENT</code>\nVí dụ: <code>/setcomm 123456789 10</code>",
+                "broadcast": "📣 Gửi: <code>/broadcast Nội dung</code>",
+            }
+            await query.edit_message_text(
+                mapping.get(action, "⚠️ Không hỗ trợ."),
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_keyboard(),
+            )
+
+    async def on_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        if not user or not update.message:
+            return
+        self._touch_user(user)
+        text = (update.message.text or "").strip()
+
+        if context.user_data.get("waiting_deposit_amount"):
+            context.user_data["waiting_deposit_amount"] = False
+            amount = parse_int(text, 0)
+            if amount <= 0:
+                await update.message.reply_text("❌ Số tiền không hợp lệ. Bấm Nạp tiền lại.", reply_markup=self._main_keyboard(user.id))
+                return
+            try:
+                pending = self.deposit_service.create_pending_deposit(user.id, amount)
+            except ValidationError as exc:
+                await update.message.reply_text(f"❌ {exc}", reply_markup=self._main_keyboard(user.id))
+                return
+
+            try:
+                await update.message.reply_photo(
+                    photo=pending.qr_url,
+                    caption=pending_deposit_caption(self.settings, pending),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self._main_keyboard(user.id),
+                )
+            except Exception:
+                self.logger.exception("Failed to send VietQR image, falling back to text.")
+                await update.message.reply_text(
+                    pending_deposit_fallback_text(self.settings, pending),
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=self._main_keyboard(user.id),
+                )
+
+            if int(self.settings.admin_id or 0) > 0:
+                try:
+                    await context.bot.send_message(
+                        chat_id=int(self.settings.admin_id),
+                        text=manual_deposit_admin_text(
+                            user_id=user.id,
+                            username=user.username,
+                            amount=pending.amount,
+                            add_info=pending.add_info,
+                            pending_id=pending.pending_id,
+                            source_label="YÊU CẦU DUYỆT NẠP TIỀN",
+                            qr_url=pending.qr_url,
+                        ),
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=deposit_approval_keyboard(pending.pending_id),
+                    )
+                except Exception:
+                    self.logger.exception("Failed to notify admin about pending deposit.")
+            return
+
+        if context.user_data.get("waiting_coupon"):
+            context.user_data["waiting_coupon"] = False
+            await self._finalize_purchase(user.id, normalize_code(text), update.message, context)
+            return
+
+        await update.message.reply_text("Chọn chức năng trong menu nhé.", reply_markup=self._main_keyboard(user.id))
+
+    async def _finalize_purchase(self, user_id: int, coupon_code: str | None, message, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if message is None:
+            return
+        product_id = context.user_data.get("purchase_product_id")
+        if not product_id:
+            await message.reply_text("❌ Không có giao dịch mua đang chờ.", reply_markup=self._main_keyboard(user_id))
+            return
+
+        try:
+            result = self.order_service.purchase_product(user_id=user_id, product_id=int(product_id), coupon_code=coupon_code)
+        except (ValidationError, BusinessRuleError) as exc:
+            await message.reply_text(str(exc), reply_markup=self._main_keyboard(user_id))
+            return
+
+        for warning in result.warnings:
+            await message.reply_text(warning, reply_markup=self._main_keyboard(user_id))
+
+        await message.reply_text(
+            purchase_success_text(result),
+            parse_mode=ParseMode.HTML,
+            reply_markup=self._main_keyboard(user_id),
+        )
+
+        if result.referrer_id and result.affiliate_earnings > 0:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(result.referrer_id),
+                    text=f"🎉 Bạn nhận hoa hồng {result.affiliate_earnings:,}đ từ đơn #{result.order_id}",
+                )
+            except Exception:
+                self.logger.exception("Failed to notify affiliate referrer.")
+
+        if int(self.settings.admin_id or 0) > 0:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(self.settings.admin_id),
+                    text=(
+                        f"🛎 Đơn mới #{result.order_id}\n"
+                        f"User: {result.user_id}\n"
+                        f"SP: {result.product_name}\n"
+                        f"Thanh toán: {result.final_price:,}đ\n"
+                        f"Mã: {result.applied_coupon or 'none'}"
+                    ),
+                )
+            except Exception:
+                self.logger.exception("Failed to notify admin about new order.")
+
+        user_row = self.user_service.get_user(user_id)
+        await self._send_log_group(context, purchase_log_text(user_row, result))
+        context.user_data.pop("purchase_product_id", None)
+
+    async def admin_guard(self, update: Update) -> bool:
+        user = update.effective_user
+        if not user or not update.message:
+            return False
+        if not self._is_admin_identity(user.id):
+            await update.message.reply_text("❌ Không có quyền admin.")
+            return False
+        if user.id not in self.admin_sessions:
+            await update.message.reply_text("⚠️ Bật admin trước bằng /checkadmin")
+            return False
+        return True
+
+    def _parse_pipe(self, raw: str) -> list[str]:
+        return [part.strip() for part in raw.split("|")]
+
+    async def cmd_addcat(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.admin_guard(update):
+            return
+        assert update.message is not None
+        try:
+            category_id = self.catalog_service.add_category(" ".join(context.args))
+        except ValidationError as exc:
+            await update.message.reply_text(f"Dùng: /addcat Tên chuyên mục\n{exc}")
+            return
+        await update.message.reply_text(f"✅ Đã thêm chuyên mục #{category_id}")
+
+    async def cmd_editcat(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.admin_guard(update):
+            return
+        assert update.message is not None
+        if len(context.args) < 2:
+            await update.message.reply_text("Dùng: /editcat ID Tên mới")
+            return
+        try:
+            category_id = parse_int(context.args[0], 0)
+            self.catalog_service.edit_category(category_id, " ".join(context.args[1:]))
+        except ValidationError as exc:
+            await update.message.reply_text(f"❌ {exc}")
+            return
+        await update.message.reply_text(f"✅ Đã sửa chuyên mục #{category_id}")
+
+    async def cmd_delcat(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.admin_guard(update):
+            return
+        assert update.message is not None
+        if not context.args:
+            await update.message.reply_text("Dùng: /delcat ID")
+            return
+        try:
+            self.catalog_service.delete_category(parse_int(context.args[0], 0))
+        except ValidationError as exc:
+            await update.message.reply_text(f"❌ {exc}")
+            return
+        await update.message.reply_text(f"✅ Đã xóa (ẩn) chuyên mục #{context.args[0]}")
+
+    async def cmd_addprod(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.admin_guard(update):
+            return
+        assert update.message is not None
+        parts = self._parse_pipe(update.message.text.replace("/addprod", "", 1).strip())
+        if len(parts) < 5:
+            await update.message.reply_text("Dùng: /addprod CAT_ID | Tên SP | Giá | Kho | Nội dung giao")
+            return
+        try:
+            product_id = self.catalog_service.add_product(
+                category_id=parse_int(parts[0], 0),
+                name=parts[1],
+                price=parse_int(parts[2], 0),
+                stock=parse_int(parts[3], 0),
+                deliver_text=parts[4],
+            )
+        except ValidationError as exc:
+            await update.message.reply_text(f"❌ {exc}")
+            return
+        await update.message.reply_text(f"✅ Đã thêm sản phẩm #{product_id}: {parts[1]}")
+
+    async def cmd_editprod(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.admin_guard(update):
+            return
+        assert update.message is not None
+        parts = self._parse_pipe(update.message.text.replace("/editprod", "", 1).strip())
+        if len(parts) < 5:
+            await update.message.reply_text("Dùng: /editprod PROD_ID | Tên SP | Giá | Kho | Nội dung giao")
+            return
+        try:
+            product_id = parse_int(parts[0], 0)
+            self.catalog_service.edit_product(
+                product_id=product_id,
+                name=parts[1],
+                price=parse_int(parts[2], 0),
+                stock=parse_int(parts[3], 0),
+                deliver_text=parts[4],
+            )
+        except ValidationError as exc:
+            await update.message.reply_text(f"❌ {exc}")
+            return
+        await update.message.reply_text(f"✅ Đã sửa sản phẩm #{product_id}")
+
+    async def cmd_delprod(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.admin_guard(update):
+            return
+        assert update.message is not None
+        if not context.args:
+            await update.message.reply_text("Dùng: /delprod PROD_ID")
+            return
+        try:
+            self.catalog_service.delete_product(parse_int(context.args[0], 0))
+        except ValidationError as exc:
+            await update.message.reply_text(f"❌ {exc}")
+            return
+        await update.message.reply_text(f"✅ Đã xóa (ẩn) sản phẩm #{context.args[0]}")
+
+    async def cmd_coupon(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.admin_guard(update):
+            return
+        assert update.message is not None
+        parts = self._parse_pipe(update.message.text.replace("/coupon", "", 1).strip())
+        if len(parts) < 6:
+            await update.message.reply_text(
+                "Dùng:\n/coupon CODE | giam_tien | giam_% | apply_prod_id_or_all | min_order | max_uses"
+            )
+            return
+        apply_part = parts[3].lower()
+        apply_product_id = None if apply_part == "all" else parse_int(apply_part, 0)
+        try:
+            self.coupon_service.save_coupon(
+                code=parts[0],
+                discount_amount=parse_int(parts[1], 0),
+                discount_percent=parse_int(parts[2], 0),
+                apply_product_id=apply_product_id,
+                min_order=parse_int(parts[4], 0),
+                max_uses=parse_int(parts[5], 0),
+            )
+        except ValidationError as exc:
+            await update.message.reply_text(f"❌ {exc}")
+            return
+        await update.message.reply_text(f"✅ Đã tạo/cập nhật coupon {normalize_code(parts[0])}")
+
+    async def cmd_couponoff(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.admin_guard(update):
+            return
+        assert update.message is not None
+        if not context.args:
+            await update.message.reply_text("Dùng: /couponoff CODE")
+            return
+        try:
+            self.coupon_service.disable_coupon(context.args[0])
+        except ValidationError as exc:
+            await update.message.reply_text(f"❌ {exc}")
+            return
+        await update.message.reply_text(f"✅ Đã tắt coupon {normalize_code(context.args[0])}")
+
+    async def cmd_setcomm(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.admin_guard(update):
+            return
+        assert update.message is not None
+        if len(context.args) < 2:
+            await update.message.reply_text("Dùng: /setcomm USER_ID PERCENT")
+            return
+        try:
+            user_id = parse_int(context.args[0], 0)
+            percent = parse_int(context.args[1], 0)
+            self.affiliate_service.set_percent(user_id, percent)
+        except ValidationError as exc:
+            await update.message.reply_text(f"❌ {exc}")
+            return
+        await update.message.reply_text(f"✅ Đã set hoa hồng user {user_id} = {percent}%")
+
+    async def cmd_broadcast(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.admin_guard(update):
+            return
+        assert update.message is not None
+        text = update.message.text.replace("/broadcast", "", 1).strip()
+        if not text:
+            await update.message.reply_text("Dùng: /broadcast Nội dung")
+            return
+        sent = 0
+        failed = 0
+        for user_id in self.user_service.get_broadcast_targets():
+            try:
+                await context.bot.send_message(chat_id=user_id, text=text)
+                sent += 1
+            except Exception:
+                failed += 1
+        await update.message.reply_text(f"✅ Broadcast xong. Sent={sent}, Fail={failed}")

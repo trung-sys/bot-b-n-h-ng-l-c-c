@@ -1,0 +1,145 @@
+from __future__ import annotations
+
+import logging
+import queue
+import shutil
+from pathlib import Path
+
+from app.bootstrap import AppContainer, build_container
+from app.bot.application import TelegramBotController
+from app.bot.handlers import TelegramShopBot
+from app.bot.text import deposit_log_text, deposit_success_text, manual_deposit_admin_text
+from app.config.settings import AppSettings
+from app.payments.bank_poller import BankPoller
+from app.utils.logging import configure_logging
+from app.utils.time import local_now
+
+
+class ApplicationRuntime:
+    def __init__(self, settings: AppSettings, log_queue: queue.Queue[str] | None = None) -> None:
+        self.log_queue = log_queue
+        self.logger = configure_logging(settings.logs_dir, log_queue)
+        self.container: AppContainer = build_container(settings, self.logger)
+        self.bot_controller: TelegramBotController | None = None
+        self.bank_poller: BankPoller | None = None
+        self._rebuild_controllers()
+
+    @property
+    def settings(self) -> AppSettings:
+        return self.container.settings
+
+    def _rebuild_controllers(self) -> None:
+        bot_handlers = TelegramShopBot(
+            settings=self.container.settings,
+            user_service=self.container.user_service,
+            catalog_service=self.container.catalog_service,
+            coupon_service=self.container.coupon_service,
+            affiliate_service=self.container.affiliate_service,
+            order_service=self.container.order_service,
+            deposit_service=self.container.deposit_service,
+            stats_service=self.container.stats_service,
+            logger=self.logger.getChild("bot"),
+        )
+        self.bot_controller = TelegramBotController(
+            settings=self.container.settings,
+            handlers=bot_handlers,
+            logger=self.logger.getChild("bot.controller"),
+        )
+        self.bank_poller = BankPoller(
+            settings=self.container.settings,
+            client=self.container.bank_client,
+            deposit_service=self.container.deposit_service,
+            on_credit=self._handle_auto_deposit_credit,
+        )
+
+    def reload(self, settings: AppSettings) -> None:
+        bot_running = self.bot_controller.is_running if self.bot_controller else False
+        bank_running = self.bank_poller.is_running if self.bank_poller else False
+        self.stop_all()
+        self.container = build_container(settings, self.logger)
+        self._rebuild_controllers()
+        if bot_running:
+            self.start_bot()
+        if bank_running:
+            self.start_bank_poller()
+
+    def start_bot(self) -> None:
+        errors = self.settings.validate_for_bot_start()
+        if errors:
+            raise RuntimeError("\n".join(errors))
+        if not self.bot_controller:
+            self._rebuild_controllers()
+        self.bot_controller.start()
+
+    def stop_bot(self) -> None:
+        if self.bot_controller:
+            self.bot_controller.stop()
+
+    def start_bank_poller(self) -> None:
+        errors = self.settings.validate_for_bank_start()
+        if errors:
+            raise RuntimeError("\n".join(errors))
+        if not self.bank_poller:
+            self._rebuild_controllers()
+        self.bank_poller.start()
+
+    def stop_bank_poller(self) -> None:
+        if self.bank_poller:
+            self.bank_poller.stop()
+
+    def stop_all(self) -> None:
+        self.stop_bank_poller()
+        self.stop_bot()
+
+    def get_dashboard_summary(self):
+        return self.container.stats_service.get_dashboard_summary()
+
+    def export_orders_csv(self):
+        return self.container.stats_service.export_orders_csv()
+
+    def export_deposits_csv(self):
+        return self.container.stats_service.export_deposits_csv()
+
+    def backup_database(self) -> Path:
+        backup_dir = self.settings.project_root / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        destination = backup_dir / f"tele_shop_{local_now().strftime('%Y%m%d_%H%M%S')}.sqlite3"
+        if self.settings.db_path.exists():
+            shutil.copy2(self.settings.db_path, destination)
+        return destination
+
+    def _handle_auto_deposit_credit(self, result) -> None:
+        self.logger.info(
+            "Auto deposit credited: user=%s amount=%s tx=%s",
+            result.user_id,
+            result.amount,
+            result.transaction_id,
+        )
+        if not self.bot_controller or not self.bot_controller.is_running:
+            return
+
+        self.bot_controller.send_message(
+            chat_id=result.user_id,
+            text=deposit_success_text(result.amount, result.transaction_id),
+        )
+        if self.settings.admin_id > 0:
+            self.bot_controller.send_message(
+                chat_id=self.settings.admin_id,
+                text=manual_deposit_admin_text(
+                    user_id=result.user_id,
+                    username=None,
+                    amount=result.amount,
+                    add_info=result.description,
+                    pending_id=result.pending_id,
+                    source_label="AUTO BANK CREDIT",
+                ),
+                parse_mode="HTML",
+            )
+        if self.settings.log_group_id > 0:
+            user_row = self.container.user_service.get_user(result.user_id)
+            self.bot_controller.send_message(
+                chat_id=self.settings.log_group_id,
+                text=deposit_log_text(user_row, result.user_id, result.amount, result.transaction_id, result.description),
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )

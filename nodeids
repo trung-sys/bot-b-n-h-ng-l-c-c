@@ -1,0 +1,112 @@
+# Telegram Shop Pro
+
+Production-grade refactor of the legacy Telegram shop bot, keeping the original business flows while hardening transactions, payment reconciliation, observability and Windows desktop operations.
+
+## What This Project Keeps
+- `/start`, `/help`, `/getchatid`, `/checkadmin`
+- Inline user menu and hidden admin panel
+- Categories, products, stock control, coupon flow, purchase history
+- Referral/affiliate flow with `start=ref_<user_id>`
+- Optional `/start` video
+- VietQR pending deposit flow with admin approve/reject buttons
+- Auto bank polling through Coderent history API
+- Deposit logs, order logs, admin notifications, broadcast
+- Windows desktop GUI with dark mode, config save/load, start/stop bot, start/stop bank poller, real-time logs
+
+## Improvements Added
+- Transaction-safe purchase flow
+- Safer manual/auto deposit reconciliation to avoid double credit
+- SQLite WAL mode, busy timeout, migrations and compatibility columns
+- Structured logging to console, file and GUI
+- Separate runtime controls for bot and bank poller
+- Dashboard stats in GUI
+- CSV export and DB backup helpers
+- Automated tests for order, coupon, deposit and affiliate services
+
+## Project Tree
+```text
+telegram_shop_pro/
+  app/
+    bootstrap.py
+    main.py
+    runtime.py
+    bot/
+    config/
+    db/
+    domain/
+    gui/
+    payments/
+    services/
+    utils/
+  data/
+  exports/
+  scripts/
+  tests/
+  .env.example
+  AUDIT.md
+  README.md
+  requirements.txt
+```
+
+## Install
+```powershell
+cd C:\Users\Windows\Documents\Codex\2026-04-23-hi\telegram_shop_pro
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+## Run On Windows
+GUI:
+```powershell
+python scripts\run_gui.py
+```
+
+Headless bot + bank poller:
+```powershell
+python scripts\run_bot.py
+```
+
+## Configuration
+Preferred options:
+- Fill values in the desktop GUI and click `Lưu Config`
+- Or create `.env` from `.env.example`
+
+Runtime files:
+- Config JSON: `data\tele_shop_config.json`
+- SQLite DB: `data\tele_shop.sqlite3`
+- Logs: `logs\app.log`
+
+## Legacy Migration
+Example:
+```powershell
+python scripts\migrate_legacy.py ^
+  --legacy-db "C:\Users\Windows\Downloads\Botshop-main\Botshop-main\tele_shop.sqlite3" ^
+  --legacy-config "C:\Users\Windows\Downloads\Botshop-main\Botshop-main\tele_shop_config.json"
+```
+
+If you want to copy runtime secrets too:
+```powershell
+python scripts\migrate_legacy.py --legacy-db "..." --legacy-config "..." --include-secrets
+```
+
+Old bot token and old bank API token from the legacy project should be rotated immediately.
+
+## Backup / Export
+Backup DB:
+```powershell
+python scripts\backup_db.py
+```
+
+Orders and deposits CSV export are available from the GUI.
+
+## Tests
+```powershell
+pytest
+```
+
+## Deploy / Packaging Notes
+- For a Windows desktop package, PyInstaller can bundle `python scripts\run_gui.py`.
+- For 24/7 headless operation, use `python scripts\run_bot.py` under NSSM, Task Scheduler or another Windows service wrapper.
+- Keep the machine online for polling and Telegram delivery.
+

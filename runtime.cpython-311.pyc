@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+from app.db.repositories.catalog import CatalogRepository
+from app.domain.exceptions import ValidationError
+from app.utils.validation import non_negative_int
+
+
+class CatalogService:
+    def __init__(self, repository: CatalogRepository) -> None:
+        self.repository = repository
+
+    def list_categories(self):
+        return self.repository.list_active_categories()
+
+    def list_products_by_category(self, category_id: int):
+        return self.repository.list_products_by_category(category_id)
+
+    def get_product(self, product_id: int):
+        return self.repository.get_product(product_id, active_only=True)
+
+    def add_category(self, name: str) -> int:
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValidationError("Tên chuyên mục không được rỗng.")
+        return self.repository.add_category(clean_name)
+
+    def edit_category(self, category_id: int, name: str) -> None:
+        if category_id <= 0 or not name.strip():
+            raise ValidationError("Dữ liệu chuyên mục không hợp lệ.")
+        self.repository.edit_category(category_id, name.strip())
+
+    def delete_category(self, category_id: int) -> None:
+        if category_id <= 0:
+            raise ValidationError("ID chuyên mục không hợp lệ.")
+        self.repository.deactivate_category(category_id)
+
+    def add_product(self, category_id: int, name: str, price: int, stock: int, deliver_text: str) -> int:
+        if category_id <= 0:
+            raise ValidationError("CAT_ID không hợp lệ.")
+        if not name.strip():
+            raise ValidationError("Tên sản phẩm không được rỗng.")
+        if price <= 0:
+            raise ValidationError("Giá sản phẩm phải lớn hơn 0.")
+        return self.repository.add_product(
+            category_id=category_id,
+            name=name.strip(),
+            price=price,
+            stock=non_negative_int(stock, 0),
+            deliver_text=deliver_text.strip(),
+        )
+
+    def edit_product(self, product_id: int, name: str, price: int, stock: int, deliver_text: str) -> None:
+        if product_id <= 0:
+            raise ValidationError("PROD_ID không hợp lệ.")
+        if not name.strip():
+            raise ValidationError("Tên sản phẩm không được rỗng.")
+        if price <= 0:
+            raise ValidationError("Giá sản phẩm phải lớn hơn 0.")
+        self.repository.edit_product(
+            product_id=product_id,
+            name=name.strip(),
+            price=price,
+            stock=non_negative_int(stock, 0),
+            deliver_text=deliver_text.strip(),
+        )
+
+    def delete_product(self, product_id: int) -> None:
+        if product_id <= 0:
+            raise ValidationError("PROD_ID không hợp lệ.")
+        self.repository.deactivate_product(product_id)
+

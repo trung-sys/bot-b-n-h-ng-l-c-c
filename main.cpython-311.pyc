@@ -1,0 +1,48 @@
+from __future__ import annotations
+
+from app.db.repositories.affiliate import AffiliateRepository
+from app.db.repositories.users import UsersRepository
+from app.domain.exceptions import ValidationError
+from app.domain.models import ReferralSummary
+
+
+class AffiliateService:
+    def __init__(self, repository: AffiliateRepository, users_repository: UsersRepository) -> None:
+        self.repository = repository
+        self.users_repository = users_repository
+
+    def get_percent(self, user_id: int, con=None) -> int:
+        return self.repository.get_percent(user_id, con=con)
+
+    def set_percent(self, user_id: int, percent: int) -> None:
+        if user_id <= 0 or not 0 <= percent <= 100:
+            raise ValidationError("Sai dữ liệu hoa hồng.")
+        self.repository.set_percent(user_id, percent)
+
+    def award_commission(
+        self,
+        referrer_id: int,
+        referred_user_id: int,
+        order_id: int,
+        final_price: int,
+        con=None,
+    ) -> int:
+        percent = self.get_percent(referrer_id, con=con)
+        amount = (final_price * percent) // 100
+        if amount <= 0:
+            return 0
+        self.users_repository.add_balance(referrer_id, amount, con=con)
+        self.repository.add_earning(referrer_id, referred_user_id, order_id, amount, con=con)
+        return amount
+
+    def build_referral_link(self, bot_username: str, user_id: int) -> str:
+        return f"https://t.me/{bot_username}?start=ref_{user_id}"
+
+    def get_summary(self, user_id: int, bot_username: str) -> ReferralSummary:
+        return ReferralSummary(
+            user_id=user_id,
+            percent=self.repository.get_percent(user_id),
+            referral_link=self.build_referral_link(bot_username, user_id),
+            total_earnings=self.repository.get_total_earnings(user_id),
+        )
+

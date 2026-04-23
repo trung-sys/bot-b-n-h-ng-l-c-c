@@ -1,0 +1,44 @@
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import pytest
+
+from app.bootstrap import build_container
+from app.config.settings import AppSettings
+
+
+@pytest.fixture()
+def app_container(tmp_path: Path):
+    settings = AppSettings(
+        project_root=tmp_path,
+        data_dir=tmp_path / "data",
+        exports_dir=tmp_path / "exports",
+        logs_dir=tmp_path / "logs",
+        db_path=tmp_path / "data" / "tele_shop.sqlite3",
+        config_path=tmp_path / "data" / "tele_shop_config.json",
+        admin_id=999,
+        bot_token="dummy-token",
+        log_group_id=0,
+        start_video_path="",
+        vietqr_bank_name="ACB",
+        vietqr_bank_id="acb",
+        vietqr_stk="123456789",
+        vietqr_ctk="TEST ACCOUNT",
+        vietqr_template="compact2",
+        bank_api_name="ACB",
+        bank_api_token="bank-token",
+        poll_interval_seconds=15,
+        auto_bank_api_text="",
+        support_contact="support@example.test",
+        maintenance_mode=False,
+        deposit_expiry_minutes=10,
+        history_limit=15,
+        command_cooldown_seconds=0,
+    )
+    logger = logging.getLogger(f"tests.{tmp_path.name}")
+    logger.handlers.clear()
+    logger.addHandler(logging.NullHandler())
+    return build_container(settings, logger)
+

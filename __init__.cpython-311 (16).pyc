@@ -1,0 +1,410 @@
+from __future__ import annotations
+
+import queue
+from dataclasses import replace
+from pathlib import Path
+
+import customtkinter as ctk
+from tkinter import filedialog, messagebox
+
+from app.config.loader import load_settings, save_settings
+from app.config.settings import AppSettings, CODERENT_BANK_CODES, DEFAULT_VIETQR_TEMPLATE, VIETQR_BANKS
+from app.gui.theme import COLOR_PALETTE
+from app.runtime import ApplicationRuntime
+from app.utils.validation import clamp, parse_bool, parse_int
+
+
+class TeleShopApp(ctk.CTk):
+    def __init__(self) -> None:
+        super().__init__()
+        ctk.set_appearance_mode("dark")
+        self.title("Telegram Shop Pro")
+        self.geometry("1360x900")
+        self.configure(fg_color=COLOR_PALETTE["bg_main"])
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.log_queue: queue.Queue[str] = queue.Queue()
+        self.settings = load_settings()
+        self.runtime = ApplicationRuntime(self.settings, self.log_queue)
+
+        self._build_ui()
+        self._refresh_status()
+        self._refresh_dashboard()
+        self.after(250, self._poll_logs)
+
+    def _build_ui(self) -> None:
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        left = ctk.CTkScrollableFrame(
+            self,
+            label_text="⚙️ Cấu hình Hệ thống",
+            label_font=ctk.CTkFont(size=20, weight="bold"),
+            fg_color=COLOR_PALETTE["card_bg"],
+            corner_radius=24,
+        )
+        right = ctk.CTkFrame(self, fg_color=COLOR_PALETTE["card_bg"], corner_radius=24)
+        left.grid(row=0, column=0, padx=20, pady=20, sticky="nsew")
+        right.grid(row=0, column=1, padx=(0, 20), pady=20, sticky="nsew")
+
+        left.grid_columnconfigure(1, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(2, weight=1)
+
+        row = 0
+        row = self._section_title(left, row, "Bot Core")
+        self.ent_admin = self._entry_row(left, row, "👑 Admin ID", str(self.settings.admin_id or ""))
+        row += 1
+        self.ent_log_group = self._entry_row(left, row, "🧾 Log Group", str(self.settings.log_group_id or ""))
+        row += 1
+        self.ent_token = self._entry_row(left, row, "🤖 Bot Token", self.settings.bot_token, show="*")
+        row += 1
+
+        ctk.CTkLabel(left, text="🎬 Video Start", text_color=COLOR_PALETTE["primary"]).grid(
+            row=row, column=0, padx=12, pady=12, sticky="w"
+        )
+        pick_row = ctk.CTkFrame(left, fg_color="transparent")
+        pick_row.grid(row=row, column=1, padx=12, pady=12, sticky="ew")
+        pick_row.grid_columnconfigure(0, weight=1)
+        self.ent_video = ctk.CTkEntry(
+            pick_row,
+            fg_color=COLOR_PALETTE["bg_main"],
+            border_color=COLOR_PALETTE["border"],
+            corner_radius=12,
+            height=38,
+        )
+        self.ent_video.grid(row=0, column=0, padx=(0, 10), sticky="ew")
+        self.ent_video.insert(0, self.settings.start_video_path)
+        ctk.CTkButton(
+            pick_row,
+            text="Chọn",
+            width=80,
+            command=self.pick_video,
+            fg_color=COLOR_PALETTE["accent"],
+            hover_color="#ff8e44",
+        ).grid(row=0, column=1, sticky="e")
+        row += 1
+
+        row = self._section_title(left, row, "VietQR")
+        ctk.CTkLabel(left, text="🏦 VietQR Bank", text_color=COLOR_PALETTE["accent"]).grid(
+            row=row, column=0, padx=12, pady=12, sticky="w"
+        )
+        self.cmb_vietqr_bank = ctk.CTkOptionMenu(
+            left,
+            values=[name for name, _ in VIETQR_BANKS],
+            fg_color=COLOR_PALETTE["accent"],
+            button_color=COLOR_PALETTE["accent"],
+            button_hover_color="#ff8e44",
+        )
+        self.cmb_vietqr_bank.grid(row=row, column=1, padx=12, pady=12, sticky="ew")
+        self.cmb_vietqr_bank.set(self.settings.vietqr_bank_name)
+        row += 1
+        self.ent_vietqr_stk = self._entry_row(left, row, "💳 Số tài khoản", self.settings.vietqr_stk)
+        row += 1
+        self.ent_vietqr_ctk = self._entry_row(left, row, "👤 Chủ tài khoản", self.settings.vietqr_ctk)
+        row += 1
+        self.ent_vietqr_tpl = self._entry_row(left, row, "🧩 Template", self.settings.vietqr_template)
+        row += 1
+
+        row = self._section_title(left, row, "Bank API")
+        ctk.CTkLabel(left, text="🏦 Bank API", text_color=COLOR_PALETTE["primary"]).grid(
+            row=row, column=0, padx=12, pady=12, sticky="w"
+        )
+        self.cmb_bank_api = ctk.CTkOptionMenu(
+            left,
+            values=list(CODERENT_BANK_CODES.keys()),
+            fg_color=COLOR_PALETTE["primary"],
+            button_color=COLOR_PALETTE["primary"],
+            button_hover_color="#6ccfff",
+        )
+        self.cmb_bank_api.grid(row=row, column=1, padx=12, pady=12, sticky="ew")
+        self.cmb_bank_api.set(self.settings.bank_api_name)
+        row += 1
+        self.ent_bank_token = self._entry_row(left, row, "🪙 API Token", self.settings.bank_api_token, show="*")
+        row += 1
+        self.ent_poll = self._entry_row(left, row, "⏱ Poll (giây)", str(self.settings.poll_interval_seconds))
+        row += 1
+
+        ctk.CTkLabel(left, text="🧾 Text API", text_color=COLOR_PALETTE["primary"]).grid(
+            row=row, column=0, padx=12, pady=12, sticky="nw"
+        )
+        self.txt_auto = ctk.CTkTextbox(
+            left,
+            height=90,
+            fg_color=COLOR_PALETTE["bg_main"],
+            border_color=COLOR_PALETTE["border"],
+            border_width=1,
+            corner_radius=12,
+        )
+        self.txt_auto.grid(row=row, column=1, padx=12, pady=12, sticky="ew")
+        if self.settings.auto_bank_api_text:
+            self.txt_auto.insert("1.0", self.settings.auto_bank_api_text)
+        row += 1
+
+        row = self._section_title(left, row, "Tùy chọn")
+        self.ent_support = self._entry_row(left, row, "🆘 Hỗ trợ", self.settings.support_contact)
+        row += 1
+        ctk.CTkLabel(left, text="🛠 Maintenance", text_color=COLOR_PALETTE["primary"]).grid(
+            row=row, column=0, padx=12, pady=12, sticky="w"
+        )
+        self.sw_maintenance = ctk.CTkSwitch(left, text="Bật chế độ bảo trì")
+        self.sw_maintenance.grid(row=row, column=1, padx=12, pady=12, sticky="w")
+        if self.settings.maintenance_mode:
+            self.sw_maintenance.select()
+        row += 1
+
+        actions = ctk.CTkFrame(right, fg_color=COLOR_PALETTE["card_alt"], corner_radius=18)
+        actions.grid(row=0, column=0, padx=16, pady=16, sticky="ew")
+        actions.grid_columnconfigure((0, 1, 2), weight=1)
+
+        buttons = [
+            ("💾 Lưu Config", self.save_clicked, COLOR_PALETTE["success"]),
+            ("🚀 Start Bot", self.start_bot_clicked, COLOR_PALETTE["primary"]),
+            ("🛑 Stop Bot", self.stop_bot_clicked, COLOR_PALETTE["danger"]),
+            ("🏦 Start Bank", self.start_bank_clicked, COLOR_PALETTE["accent"]),
+            ("⏹ Stop Bank", self.stop_bank_clicked, "#c35f00"),
+            ("♻️ Reload", self.reload_clicked, "#6f7d8c"),
+        ]
+        for index, (label, command, color) in enumerate(buttons):
+            ctk.CTkButton(
+                actions,
+                text=label,
+                command=command,
+                fg_color=color,
+                hover_color=color,
+                height=38,
+                corner_radius=12,
+            ).grid(row=index // 3, column=index % 3, padx=8, pady=8, sticky="ew")
+
+        tool_row = ctk.CTkFrame(right, fg_color=COLOR_PALETTE["card_alt"], corner_radius=18)
+        tool_row.grid(row=1, column=0, padx=16, pady=(0, 16), sticky="ew")
+        tool_row.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        tool_buttons = [
+            ("📈 Refresh Stats", self._refresh_dashboard, COLOR_PALETTE["primary"]),
+            ("💾 Backup DB", self.backup_clicked, COLOR_PALETTE["success"]),
+            ("📤 Orders CSV", self.export_orders_clicked, COLOR_PALETTE["accent"]),
+            ("📤 Deposits CSV", self.export_deposits_clicked, "#7d5cff"),
+        ]
+        for index, (label, command, color) in enumerate(tool_buttons):
+            ctk.CTkButton(
+                tool_row,
+                text=label,
+                command=command,
+                fg_color=color,
+                hover_color=color,
+                height=38,
+                corner_radius=12,
+            ).grid(row=0, column=index, padx=8, pady=8, sticky="ew")
+
+        self.status_frame = ctk.CTkFrame(right, fg_color=COLOR_PALETTE["card_alt"], corner_radius=18)
+        self.status_frame.grid(row=2, column=0, padx=16, pady=(0, 16), sticky="new")
+        self.status_frame.grid_columnconfigure((0, 1), weight=1)
+        self.lbl_bot_status = self._stat_card(self.status_frame, 0, 0, "Bot")
+        self.lbl_bank_status = self._stat_card(self.status_frame, 0, 1, "Bank Poll")
+        self.lbl_users = self._stat_card(self.status_frame, 1, 0, "Users")
+        self.lbl_orders = self._stat_card(self.status_frame, 1, 1, "Orders")
+        self.lbl_revenue = self._stat_card(self.status_frame, 2, 0, "Revenue")
+        self.lbl_deposits = self._stat_card(self.status_frame, 2, 1, "Deposits")
+        self.lbl_products = self._stat_card(self.status_frame, 3, 0, "Products")
+        self.lbl_pending = self._stat_card(self.status_frame, 3, 1, "Pending")
+
+        tabs = ctk.CTkTabview(right, fg_color=COLOR_PALETTE["card_bg"], segmented_button_fg_color=COLOR_PALETTE["card_alt"])
+        tabs.grid(row=3, column=0, padx=16, pady=(0, 16), sticky="nsew")
+        right.grid_rowconfigure(3, weight=1)
+        tab_logs = tabs.add("Logs")
+        tab_logs.grid_columnconfigure(0, weight=1)
+        tab_logs.grid_rowconfigure(0, weight=1)
+        self.txt_log = ctk.CTkTextbox(
+            tab_logs,
+            fg_color=COLOR_PALETTE["bg_main"],
+            border_color=COLOR_PALETTE["border"],
+            border_width=1,
+            corner_radius=16,
+            text_color=COLOR_PALETTE["text_primary"],
+        )
+        self.txt_log.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
+        self.txt_log.insert(
+            "1.0",
+            "Runtime dashboard sẵn sàng.\n"
+            "• Lưu config trước khi start service.\n"
+            "• Bot và Bank Poll có thể start/stop độc lập.\n"
+            "• Backup và CSV export sử dụng cùng data layer với bot.\n",
+        )
+
+    def _section_title(self, parent, row: int, text: str) -> int:
+        ctk.CTkLabel(
+            parent,
+            text=text,
+            font=ctk.CTkFont(size=18, weight="bold"),
+            text_color=COLOR_PALETTE["text_primary"],
+        ).grid(row=row, column=0, columnspan=2, padx=12, pady=(18, 6), sticky="w")
+        return row + 1
+
+    def _entry_row(self, parent, row: int, label: str, value: str, show: str | None = None):
+        ctk.CTkLabel(parent, text=label, text_color=COLOR_PALETTE["text_primary"]).grid(
+            row=row, column=0, padx=12, pady=12, sticky="w"
+        )
+        entry = ctk.CTkEntry(
+            parent,
+            show=show,
+            fg_color=COLOR_PALETTE["bg_main"],
+            border_color=COLOR_PALETTE["border"],
+            corner_radius=12,
+            height=38,
+        )
+        entry.grid(row=row, column=1, padx=12, pady=12, sticky="ew")
+        entry.insert(0, value or "")
+        return entry
+
+    def _stat_card(self, parent, row: int, column: int, title: str):
+        frame = ctk.CTkFrame(parent, fg_color=COLOR_PALETTE["bg_main"], corner_radius=14)
+        frame.grid(row=row, column=column, padx=8, pady=8, sticky="ew")
+        frame.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(frame, text=title, text_color=COLOR_PALETTE["text_secondary"]).grid(
+            row=0, column=0, padx=12, pady=(10, 2), sticky="w"
+        )
+        label = ctk.CTkLabel(frame, text="--", font=ctk.CTkFont(size=22, weight="bold"), text_color=COLOR_PALETTE["text_primary"])
+        label.grid(row=1, column=0, padx=12, pady=(2, 10), sticky="w")
+        return label
+
+    def pick_video(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Chọn video gửi khi /start",
+            filetypes=[("Video files", "*.mp4 *.mov *.mkv *.avi"), ("All files", "*.*")],
+        )
+        if path:
+            self.ent_video.delete(0, "end")
+            self.ent_video.insert(0, path)
+
+    def _read_settings(self) -> AppSettings:
+        current = self.settings
+        bank_name = self.cmb_vietqr_bank.get().strip()
+        bank_id = dict(VIETQR_BANKS).get(bank_name, "vietcombank")
+        return replace(
+            current,
+            admin_id=parse_int(self.ent_admin.get(), 0),
+            log_group_id=parse_int(self.ent_log_group.get(), 0),
+            bot_token=self.ent_token.get().strip(),
+            start_video_path=self.ent_video.get().strip(),
+            vietqr_bank_name=bank_name,
+            vietqr_bank_id=bank_id,
+            vietqr_stk=self.ent_vietqr_stk.get().strip(),
+            vietqr_ctk=self.ent_vietqr_ctk.get().strip(),
+            vietqr_template=self.ent_vietqr_tpl.get().strip() or DEFAULT_VIETQR_TEMPLATE,
+            bank_api_name=self.cmb_bank_api.get().strip(),
+            bank_api_token=self.ent_bank_token.get().strip(),
+            poll_interval_seconds=clamp(parse_int(self.ent_poll.get(), 15), 5, 3600),
+            auto_bank_api_text=self.txt_auto.get("1.0", "end").strip(),
+            support_contact=self.ent_support.get().strip(),
+            maintenance_mode=parse_bool(bool(self.sw_maintenance.get()), False),
+        )
+
+    def save_clicked(self) -> None:
+        self.settings = self._read_settings()
+        save_settings(self.settings)
+        self._append_log("✅ Đã lưu config.")
+        self._refresh_status()
+        self._refresh_dashboard()
+
+    def start_bot_clicked(self) -> None:
+        try:
+            self.settings = self._read_settings()
+            save_settings(self.settings)
+            self.runtime.reload(self.settings)
+            self.runtime.start_bot()
+            self._append_log("▶️ Bot started.")
+            self._refresh_status()
+        except Exception as exc:
+            messagebox.showerror("Start Bot Error", str(exc))
+
+    def stop_bot_clicked(self) -> None:
+        self.runtime.stop_bot()
+        self._append_log("⛔ Bot stop requested.")
+        self._refresh_status()
+
+    def start_bank_clicked(self) -> None:
+        try:
+            self.settings = self._read_settings()
+            save_settings(self.settings)
+            self.runtime.reload(self.settings)
+            self.runtime.start_bank_poller()
+            self._append_log("🏦 Bank poller started.")
+            self._refresh_status()
+        except Exception as exc:
+            messagebox.showerror("Start Bank Error", str(exc))
+
+    def stop_bank_clicked(self) -> None:
+        self.runtime.stop_bank_poller()
+        self._append_log("⏹ Bank poller stop requested.")
+        self._refresh_status()
+
+    def reload_clicked(self) -> None:
+        self.settings = self._read_settings()
+        save_settings(self.settings)
+        self.runtime.reload(self.settings)
+        self._append_log("♻️ Runtime reloaded.")
+        self._refresh_status()
+        self._refresh_dashboard()
+
+    def backup_clicked(self) -> None:
+        try:
+            path = self.runtime.backup_database()
+            self._append_log(f"💾 Backup created: {path}")
+            messagebox.showinfo("Backup", f"Backup DB thành công:\n{path}")
+        except Exception as exc:
+            messagebox.showerror("Backup Error", str(exc))
+
+    def export_orders_clicked(self) -> None:
+        try:
+            result = self.runtime.export_orders_csv()
+            self._append_log(f"📤 Orders CSV: {result.path} ({result.row_count} rows)")
+            messagebox.showinfo("Orders CSV", f"Đã export {result.row_count} dòng:\n{result.path}")
+        except Exception as exc:
+            messagebox.showerror("Export Orders Error", str(exc))
+
+    def export_deposits_clicked(self) -> None:
+        try:
+            result = self.runtime.export_deposits_csv()
+            self._append_log(f"📤 Deposits CSV: {result.path} ({result.row_count} rows)")
+            messagebox.showinfo("Deposits CSV", f"Đã export {result.row_count} dòng:\n{result.path}")
+        except Exception as exc:
+            messagebox.showerror("Export Deposits Error", str(exc))
+
+    def _refresh_status(self) -> None:
+        bot_running = self.runtime.bot_controller.is_running if self.runtime.bot_controller else False
+        bank_running = self.runtime.bank_poller.is_running if self.runtime.bank_poller else False
+        self.lbl_bot_status.configure(text="RUNNING" if bot_running else "STOPPED", text_color=COLOR_PALETTE["success"] if bot_running else COLOR_PALETTE["danger"])
+        self.lbl_bank_status.configure(text="RUNNING" if bank_running else "STOPPED", text_color=COLOR_PALETTE["success"] if bank_running else COLOR_PALETTE["danger"])
+
+    def _refresh_dashboard(self) -> None:
+        summary = self.runtime.get_dashboard_summary()
+        self.lbl_users.configure(text=str(summary.total_users))
+        self.lbl_orders.configure(text=str(summary.total_orders))
+        self.lbl_revenue.configure(text=f"{summary.total_revenue:,}đ")
+        self.lbl_deposits.configure(text=f"{summary.total_deposits:,}đ")
+        self.lbl_products.configure(text=str(summary.active_products))
+        self.lbl_pending.configure(text=str(summary.pending_deposits))
+        self._refresh_status()
+
+    def _append_log(self, line: str) -> None:
+        self.txt_log.insert("end", f"{line}\n")
+        self.txt_log.see("end")
+
+    def _poll_logs(self) -> None:
+        try:
+            while True:
+                self._append_log(self.log_queue.get_nowait())
+        except queue.Empty:
+            pass
+        self.after(250, self._poll_logs)
+
+    def on_close(self) -> None:
+        self.runtime.stop_all()
+        self.destroy()
+
+
+def run_gui() -> None:
+    app = TeleShopApp()
+    app.mainloop()

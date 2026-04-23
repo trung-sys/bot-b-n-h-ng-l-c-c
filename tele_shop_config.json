@@ -1,0 +1,96 @@
+from __future__ import annotations
+
+from app.db.repositories.coupons import CouponsRepository
+from app.domain.exceptions import ValidationError
+from app.domain.models import CouponDecision
+from app.utils.validation import clamp, normalize_code
+
+
+class CouponService:
+    def __init__(self, repository: CouponsRepository) -> None:
+        self.repository = repository
+
+    def evaluate_coupon(self, product_id: int, price: int, coupon_code: str | None, con=None) -> CouponDecision:
+        if not coupon_code:
+            return CouponDecision(requested_code=None, applied_code=None, discount=0)
+
+        code = normalize_code(coupon_code)
+        coupon = self.repository.get_coupon(code, active_only=True, con=con)
+        if not coupon:
+            return CouponDecision(
+                requested_code=code,
+                applied_code=None,
+                discount=0,
+                warnings=["❌ Mã giảm giá không hợp lệ hoặc đã tắt. Tiếp tục mua không giảm."],
+            )
+
+        max_uses = int(coupon["max_uses"] or 0)
+        used_count = int(coupon["used_count"] or 0)
+        if max_uses > 0 and used_count >= max_uses:
+            return CouponDecision(
+                requested_code=code,
+                applied_code=None,
+                discount=0,
+                warnings=["❌ Mã đã hết lượt dùng. Tiếp tục mua không giảm."],
+            )
+
+        min_order = int(coupon["min_order"] or 0)
+        if price < min_order:
+            return CouponDecision(
+                requested_code=code,
+                applied_code=None,
+                discount=0,
+                warnings=[f"❌ Đơn tối thiểu {min_order:,}đ mới áp mã. Tiếp tục mua không giảm."],
+            )
+
+        apply_product_id = coupon["apply_product_id"]
+        if apply_product_id is not None and int(apply_product_id) != int(product_id):
+            return CouponDecision(
+                requested_code=code,
+                applied_code=None,
+                discount=0,
+                warnings=["❌ Mã này không áp dụng cho sản phẩm này. Tiếp tục mua không giảm."],
+            )
+
+        discount_amount = int(coupon["discount_amount"] or 0)
+        discount_percent = int(coupon["discount_percent"] or 0)
+        discount = (price * discount_percent) // 100 if discount_percent > 0 else discount_amount
+        return CouponDecision(
+            requested_code=code,
+            applied_code=code,
+            discount=clamp(discount, 0, price),
+        )
+
+    def save_coupon(
+        self,
+        code: str,
+        discount_amount: int,
+        discount_percent: int,
+        apply_product_id: int | None,
+        min_order: int,
+        max_uses: int,
+    ) -> None:
+        clean_code = normalize_code(code)
+        if not clean_code:
+            raise ValidationError("CODE rỗng.")
+        if not 0 <= discount_percent <= 100:
+            raise ValidationError("% giảm không hợp lệ (0-100).")
+        if discount_amount < 0 or min_order < 0 or max_uses < 0:
+            raise ValidationError("Giá trị giảm/min/max phải >= 0.")
+        if apply_product_id is not None and apply_product_id <= 0:
+            raise ValidationError("apply_prod_id_or_all phải là all hoặc số ID sản phẩm.")
+        self.repository.upsert_coupon(
+            clean_code,
+            discount_amount=discount_amount,
+            discount_percent=discount_percent,
+            apply_product_id=apply_product_id,
+            min_order=min_order,
+            max_uses=max_uses,
+        )
+
+    def disable_coupon(self, code: str) -> None:
+        clean_code = normalize_code(code)
+        if not clean_code:
+            raise ValidationError("CODE rỗng.")
+        self.repository.deactivate_coupon(clean_code)
+

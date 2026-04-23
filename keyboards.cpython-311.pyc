@@ -1,0 +1,7 @@
+from __future__ import annotations
+
+from app.gui.app_gui import run_gui
+
+
+if __name__ == "__main__":
+    run_gui()

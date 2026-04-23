@@ -1,0 +1,92 @@
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.config.loader import load_settings, save_settings
+from app.config.settings import AppSettings
+from app.db.connection import Database
+from app.db.migrations import migrate_database
+from app.utils.validation import clamp
+
+
+def map_legacy_config(legacy: dict[str, object], current: AppSettings, include_secrets: bool) -> AppSettings:
+    bot_token = str(legacy.get("bot_token", "")) if include_secrets else ""
+    bank_api_token = str(legacy.get("bank_v3_token", "")) if include_secrets else ""
+    return AppSettings(
+        project_root=current.project_root,
+        data_dir=current.data_dir,
+        exports_dir=current.exports_dir,
+        logs_dir=current.logs_dir,
+        db_path=current.db_path,
+        config_path=current.config_path,
+        admin_id=int(legacy.get("admin_id", 0) or 0),
+        bot_token=bot_token,
+        log_group_id=int(legacy.get("log_group_id", 0) or 0),
+        start_video_path=str(legacy.get("start_video_path", "") or ""),
+        vietqr_bank_name=str(legacy.get("vietqr_bank_name", "Vietcombank") or "Vietcombank"),
+        vietqr_bank_id=str(legacy.get("vietqr_bank_id", "vietcombank") or "vietcombank"),
+        vietqr_stk=str(legacy.get("vietqr_stk", "") or ""),
+        vietqr_ctk=str(legacy.get("vietqr_ctk", "") or ""),
+        vietqr_template=str(legacy.get("vietqr_template", "compact2") or "compact2"),
+        bank_api_name=str(legacy.get("bank_v3_name", "Vietcombank") or "Vietcombank"),
+        bank_api_token=bank_api_token,
+        poll_interval_seconds=clamp(int(legacy.get("poll_interval", 15) or 15), 5, 3600),
+        auto_bank_api_text=str(legacy.get("auto_bank_api_text", "") or ""),
+        support_contact="",
+        maintenance_mode=False,
+        deposit_expiry_minutes=10,
+        history_limit=15,
+        command_cooldown_seconds=2,
+        bank_api_base_url="https://api.coderent.one",
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Migrate legacy Botshop data/config into the production refactor.")
+    parser.add_argument("--legacy-db", required=True, help="Path to tele_shop.sqlite3 from the legacy project.")
+    parser.add_argument("--legacy-config", required=False, help="Path to tele_shop_config.json from the legacy project.")
+    parser.add_argument(
+        "--include-secrets",
+        action="store_true",
+        help="Also migrate runtime secrets from the legacy config. Rotate old secrets immediately after migration.",
+    )
+    args = parser.parse_args()
+
+    runtime_settings = load_settings()
+    runtime_settings.ensure_directories()
+
+    legacy_db = Path(args.legacy_db).expanduser().resolve()
+    if not legacy_db.exists():
+        raise FileNotFoundError(f"Legacy DB not found: {legacy_db}")
+
+    shutil.copy2(legacy_db, runtime_settings.db_path)
+    migrate_database(Database(runtime_settings.db_path))
+
+    if args.legacy_config:
+        legacy_config_path = Path(args.legacy_config).expanduser().resolve()
+        if not legacy_config_path.exists():
+            raise FileNotFoundError(f"Legacy config not found: {legacy_config_path}")
+        legacy_data = json.loads(legacy_config_path.read_text(encoding="utf-8"))
+        migrated = map_legacy_config(legacy_data, runtime_settings, include_secrets=args.include_secrets)
+        save_settings(migrated)
+
+    print("Legacy DB migrated successfully.")
+    print(f"New DB path: {runtime_settings.db_path}")
+    if args.legacy_config:
+        print(f"New config path: {runtime_settings.config_path}")
+        if not args.include_secrets:
+            print("Secrets were intentionally omitted. Fill them via GUI or .env and rotate old tokens.")
+        else:
+            print("Secrets were copied for convenience. Rotate the old bot/API tokens immediately.")
+
+
+if __name__ == "__main__":
+    main()

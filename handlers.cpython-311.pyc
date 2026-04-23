@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+
+from app.config.settings import AppSettings
+from app.db.connection import Database
+from app.db.migrations import migrate_database
+from app.db.repositories.affiliate import AffiliateRepository
+from app.db.repositories.catalog import CatalogRepository
+from app.db.repositories.commerce import DepositsRepository, OrdersRepository
+from app.db.repositories.coupons import CouponsRepository
+from app.db.repositories.stats import StatsRepository
+from app.db.repositories.users import UsersRepository
+from app.payments.bank_client import CoderentBankClient
+from app.services.affiliate_service import AffiliateService
+from app.services.catalog_service import CatalogService
+from app.services.coupon_service import CouponService
+from app.services.deposit_service import DepositService
+from app.services.order_service import OrderService
+from app.services.stats_service import StatsService
+from app.services.user_service import UserService
+
+
+@dataclass(slots=True)
+class AppContainer:
+    settings: AppSettings
+    logger: logging.Logger
+    database: Database
+    users_repository: UsersRepository
+    catalog_repository: CatalogRepository
+    coupons_repository: CouponsRepository
+    affiliate_repository: AffiliateRepository
+    orders_repository: OrdersRepository
+    deposits_repository: DepositsRepository
+    stats_repository: StatsRepository
+    user_service: UserService
+    catalog_service: CatalogService
+    coupon_service: CouponService
+    affiliate_service: AffiliateService
+    order_service: OrderService
+    deposit_service: DepositService
+    stats_service: StatsService
+    bank_client: CoderentBankClient
+
+
+def build_container(settings: AppSettings, logger: logging.Logger) -> AppContainer:
+    settings.ensure_directories()
+    database = Database(settings.db_path)
+    migrate_database(database)
+
+    users_repository = UsersRepository(database)
+    catalog_repository = CatalogRepository(database)
+    coupons_repository = CouponsRepository(database)
+    affiliate_repository = AffiliateRepository(database)
+    orders_repository = OrdersRepository(database)
+    deposits_repository = DepositsRepository(database)
+    stats_repository = StatsRepository(database)
+
+    user_service = UserService(users_repository, orders_repository)
+    catalog_service = CatalogService(catalog_repository)
+    coupon_service = CouponService(coupons_repository)
+    affiliate_service = AffiliateService(affiliate_repository, users_repository)
+    order_service = OrderService(
+        database=database,
+        users_repository=users_repository,
+        catalog_repository=catalog_repository,
+        coupons_repository=coupons_repository,
+        orders_repository=orders_repository,
+        affiliate_repository=affiliate_repository,
+        coupon_service=coupon_service,
+        affiliate_service=affiliate_service,
+    )
+    deposit_service = DepositService(
+        settings=settings,
+        database=database,
+        users_repository=users_repository,
+        deposits_repository=deposits_repository,
+    )
+    stats_service = StatsService(settings=settings, repository=stats_repository)
+    bank_client = CoderentBankClient()
+
+    return AppContainer(
+        settings=settings,
+        logger=logger,
+        database=database,
+        users_repository=users_repository,
+        catalog_repository=catalog_repository,
+        coupons_repository=coupons_repository,
+        affiliate_repository=affiliate_repository,
+        orders_repository=orders_repository,
+        deposits_repository=deposits_repository,
+        stats_repository=stats_repository,
+        user_service=user_service,
+        catalog_service=catalog_service,
+        coupon_service=coupon_service,
+        affiliate_service=affiliate_service,
+        order_service=order_service,
+        deposit_service=deposit_service,
+        stats_service=stats_service,
+        bank_client=bank_client,
+    )
+
